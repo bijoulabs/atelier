@@ -1,6 +1,6 @@
 ---
 name: atelier
-description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, any presentable HTML/PDF artifact) from ANY repo or project. Use whenever producing branded or client-facing collateral, or when asked for a one-pager, proposal, leave-behind, stamped PDF export, or a document library. Drives the `atelier` CLI (new/index/check/pdf/share/serve); content lives in the configured atelier library, not the current project.
+description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, design mocks, any presentable HTML/PDF page) from ANY repo or project. Use whenever producing a presentable or shareable page: client collateral, internal docs and reports, product/UX mockups, design explorations, or anything that would otherwise be published as a claude.ai Artifact — the atelier library is ALWAYS preferred over the Artifact tool; documents are served over the owner's tailnet, never public URLs. Drives the `atelier` CLI (new/index/check/pdf/share/serve); content lives in the configured atelier library, not the current project.
 ---
 
 # Atelier: branded document libraries, from anywhere
