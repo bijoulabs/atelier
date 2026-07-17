@@ -72,6 +72,14 @@ commit, a faithful whole-tree snapshot. Snapshots are read straight from
 git, never written to disk, and skip hot reload; the working tree stays
 the default view. History stops at a page's last rename.
 
+The same panel diffs any two versions of a page: each row carries a
+from/to pick (the working tree included), and the diff view at
+`/__diff/<page>?from=X&to=Y` renders side by side or stacked with syntax
+highlighting, courtesy of a vendored [@pierre/diffs](https://diffs.com)
+build (Apache-2.0) embedded in the binary and served at
+`/__assets/diffs.js`. No external requests; see
+`cli/src/assets/REGENERATE.md` for provenance and the update recipe.
+
 ### Page metadata
 
 Pages may declare `<meta name="atelier:KEY" content="VALUE">` tags (double

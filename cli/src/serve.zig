@@ -7,12 +7,19 @@ pub const Route = union(enum) {
     file: []const u8,
     snapshot: Snapshot,
     history: []const u8,
+    diff: Diff,
+    diffs_bundle,
     reload,
     bad,
 
     /// A whole-tree time-travel view: `rel` resolved against the library
     /// as of commit `sha` instead of the working tree.
     pub const Snapshot = struct { sha: []const u8, rel: []const u8 };
+
+    /// A rendered comparison of one page across two versions. `from` and
+    /// `to` are each a commit sha or the literal `current` (the working
+    /// tree); mapPath validates both before this route exists.
+    pub const Diff = struct { rel: []const u8, from: []const u8, to: []const u8 };
 };
 
 /// Maps an HTTP request target to a `Route`. Pure and testable: strips a
@@ -29,14 +36,30 @@ pub const Route = union(enum) {
 /// allocate nothing.
 pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     var target = raw_target;
-    if (std.mem.indexOfScalar(u8, target, '?')) |q| target = target[0..q];
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+        query = target[q + 1 ..];
+        target = target[0..q];
+    }
     if (std.mem.eql(u8, target, "/__reload")) return .reload;
+    if (std.mem.eql(u8, target, "/__assets/diffs.js")) return .diffs_bundle;
     if (std.mem.indexOfScalar(u8, target, '\\') != null) return .bad;
     if (!std.mem.startsWith(u8, target, "/")) return .bad;
     var it = std.mem.splitScalar(u8, target[1..], '/');
     while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return .bad;
     if (std.mem.startsWith(u8, target, "/__history/")) {
         return .{ .history = try relFromPath(alloc, target["/__history".len..]) };
+    }
+    if (std.mem.startsWith(u8, target, "/__diff/")) {
+        const from = queryParam(query, "from") orelse return .bad;
+        const to = queryParam(query, "to") orelse return .bad;
+        if (!isVersionRef(from)) return .bad;
+        if (!isVersionRef(to)) return .bad;
+        const rel = try relFromPath(alloc, target["/__diff".len..]);
+        errdefer alloc.free(rel);
+        const from_owned = try alloc.dupe(u8, from);
+        errdefer alloc.free(from_owned);
+        return .{ .diff = .{ .rel = rel, .from = from_owned, .to = try alloc.dupe(u8, to) } };
     }
     if (std.mem.startsWith(u8, target, "/@")) {
         const after = target[2..];
@@ -49,6 +72,26 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
         return .{ .snapshot = .{ .sha = try alloc.dupe(u8, sha), .rel = rel } };
     }
     return .{ .file = try relFromPath(alloc, target) };
+}
+
+/// Finds the value of `name` in a raw query string of `a=b&c=d` pairs, or
+/// null when absent. No percent-decoding: the only values atelier reads
+/// through this are commit shas and the literal `current`, and anything
+/// else fails validation right after.
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Whether `s` names a version a diff can be taken against: a commit sha
+/// or the literal `current` (the working tree). Case-sensitive on
+/// purpose; `current` is a protocol token, not prose.
+fn isVersionRef(s: []const u8) bool {
+    return std.mem.eql(u8, s, "current") or history.isCommitSha(s);
 }
 
 /// Maps an absolute URL path (leading `/`, already traversal-checked by
@@ -90,6 +133,24 @@ pub fn contentType(path: []const u8) []const u8 {
 
 /// Upper bound on how large a single served file is allowed to be.
 const file_bytes_max = 32 * 1024 * 1024;
+
+/// The vendored @pierre/diffs + Shiki bundle served at /__assets/diffs.js.
+/// NOTE: this is the one third-party artifact in an otherwise
+/// zero-dependency repo, admitted as a committed, license-noted blob
+/// (Apache-2.0); `zig build` never runs npm. Provenance, the size fence,
+/// and the regeneration recipe live in `assets/REGENERATE.md`.
+const diffs_bundle_js = @embedFile("assets/pierre_diffs.js");
+
+/// Reads one version of `rel`: the working tree for `current`, `git show`
+/// for a commit sha. Null when that version does not exist or cannot be
+/// read; the caller turns that into a specific 404.
+fn loadVersion(alloc: std.mem.Allocator, io: std.Io, root: []const u8, ref: []const u8, rel: []const u8) ?[]u8 {
+    if (std.mem.eql(u8, ref, "current")) {
+        const abs = std.fs.path.join(alloc, &.{ root, rel }) catch return null;
+        return std.Io.Dir.cwd().readFileAlloc(io, abs, alloc, .limited(file_bytes_max)) catch null;
+    }
+    return history.showFile(alloc, io, root, ref, rel, file_bytes_max);
+}
 
 const net = std.Io.net;
 
@@ -181,6 +242,22 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
     const route = mapPath(a, target) catch return;
     switch (route) {
         .bad => return writeBody(stream, io, "400 Bad Request", "text/plain", "bad path\n"),
+        .diffs_bundle => {
+            // The one deliberate exemption from the global no-store: the
+            // bundle is immutable per binary, and it is 2.3 MB the browser
+            // should not refetch on every diff view.
+            return writeBodyCached(stream, io, "200 OK", "text/javascript; charset=utf-8", "public, max-age=31536000, immutable", diffs_bundle_js);
+        },
+        .diff => |d| {
+            const old_content = loadVersion(a, io, root, d.from, d.rel) orelse {
+                return writeBody(stream, io, "404 Not Found", "text/plain", "from version not found\n");
+            };
+            const new_content = loadVersion(a, io, root, d.to, d.rel) orelse {
+                return writeBody(stream, io, "404 Not Found", "text/plain", "to version not found\n");
+            };
+            const page = renderDiffPage(a, d.rel, d.from, d.to, old_content, new_content) catch return;
+            return writeBody(stream, io, "200 OK", "text/html; charset=utf-8", page);
+        },
         .history => |rel| {
             const commits = history.pageLog(a, io, root, rel);
             const json = history.renderJson(a, commits) catch return;
@@ -249,11 +326,18 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
 /// dropped in favor of `w.interface.print` straight into that writer; same
 /// bytes on the wire, one fewer manual buffer.
 fn writeBody(stream: net.Stream, io: std.Io, status: []const u8, ctype: []const u8, body: []const u8) void {
+    writeBodyCached(stream, io, status, ctype, "no-store", body);
+}
+
+/// `writeBody` with an explicit `Cache-Control`. Only the vendored diffs
+/// bundle uses a value other than `no-store`; see the `.diffs_bundle`
+/// arm in `handleConn` for why.
+fn writeBodyCached(stream: net.Stream, io: std.Io, status: []const u8, ctype: []const u8, cache: []const u8, body: []const u8) void {
     var send_buf: [4096]u8 = undefined;
     var w = stream.writer(io, &send_buf);
     w.interface.print(
-        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        .{ status, ctype, body.len },
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: {s}\r\nConnection: close\r\n\r\n",
+        .{ status, ctype, body.len, cache },
     ) catch return;
     w.interface.writeAll(body) catch return;
     w.interface.flush() catch return;
@@ -293,16 +377,28 @@ pub const home_snippet = "<style>@media print{#atelier-home{display:none}}</styl
 /// snapshot. On a snapshot view the chip shows the pinned sha (and
 /// renders even with an empty list, so the way back to `current` never
 /// disappears). Subjects go through `textContent`, never innerHTML.
+///
+/// Each row also carries a from/to radio pair feeding the `diff` action,
+/// which links to `/__diff<path>?from=X&to=Y`. One-sided picks fill the
+/// other side by convention: a lone `from` diffs against `current`, a
+/// lone `to` diffs against its parent (the next row down). On a snapshot
+/// view the pinned sha and `current` come pre-selected.
 pub const history_snippet = "<style>@media print{#atelier-history,#atelier-history-panel{display:none}}" ++
     "#atelier-history{position:fixed;top:14px;right:14px;z-index:9999;display:none;" ++
     "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
     "color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px;cursor:pointer}" ++
     "#atelier-history-panel{position:fixed;top:40px;right:14px;z-index:9999;display:none;" ++
-    "max-height:60vh;overflow:auto;min-width:260px;background:rgba(20,18,15,.92);" ++
+    "max-height:60vh;overflow:auto;min-width:300px;background:rgba(20,18,15,.92);" ++
     "font:11px/1.5 ui-monospace,monospace;padding:6px 0;border-radius:2px}" ++
-    "#atelier-history-panel a{display:block;padding:5px 12px;color:#fff;text-decoration:none;white-space:nowrap}" ++
-    "#atelier-history-panel a:hover{background:rgba(255,255,255,.12)}" ++
-    "#atelier-history-panel a.now{opacity:.55}</style>" ++
+    "#atelier-history-panel>div{display:flex;align-items:center;gap:6px;padding:5px 12px}" ++
+    "#atelier-history-panel>div:hover{background:rgba(255,255,255,.12)}" ++
+    "#atelier-history-panel input{margin:0;accent-color:#fff}" ++
+    "#atelier-history-panel a{color:#fff;text-decoration:none;white-space:nowrap}" ++
+    "#atelier-history-panel a.now{opacity:.55}" ++
+    "#atelier-diff-go{display:block;text-align:center;margin:6px 12px 4px;padding:5px 0;" ++
+    "border:1px solid rgba(255,255,255,.4);border-radius:2px;" ++
+    "letter-spacing:.14em;text-transform:uppercase;font-weight:600}" ++
+    "#atelier-diff-go.off{opacity:.3;pointer-events:none}</style>" ++
     "<div id=\"atelier-history\"></div><div id=\"atelier-history-panel\"></div>" ++
     "<script>(()=>{" ++
     "const m=location.pathname.match(/^\\/@([0-9a-fA-F]{7,40})(\\/.*)?$/);" ++
@@ -312,13 +408,128 @@ pub const history_snippet = "<style>@media print{#atelier-history,#atelier-histo
     "fetch('/__history'+path).then(r=>r.json()).then(list=>{" ++
     "if(!list.length&&!pin)return;" ++
     "chip.textContent=pin?'\\u23f1 '+pin:'history';chip.style.display='block';" ++
-    "const add=(href,label,now)=>{const a=document.createElement('a');" ++
-    "a.href=href;a.textContent=label;if(now)a.className='now';panel.appendChild(a);};" ++
-    "add(path,'current',!pin);" ++
-    "list.forEach(c=>add('/@'+c.sha+path,c.date+'  '+c.subject+'  '+c.sha,pin===c.sha));" ++
+    // refs, newest first, with the working tree in front: the parent of
+    // refs[i] is refs[i+1], which drives the one-sided pick defaults.
+    "const refs=['current'].concat(list.map(c=>c.sha));" ++
+    "const sel={from:pin,to:pin?'current':null};" ++
+    "const go=document.createElement('a');go.id='atelier-diff-go';go.textContent='diff';" ++
+    "const sync=()=>{let f=sel.from,t=sel.to;" ++
+    "if(f&&!t)t='current';" ++
+    "if(!f&&t){const i=refs.indexOf(t);f=i>=0&&i+1<refs.length?refs[i+1]:null;}" ++
+    "if(f&&t&&f!==t){go.href='/__diff'+path+'?from='+f+'&to='+t;go.classList.remove('off');}" ++
+    "else{go.removeAttribute('href');go.classList.add('off');}};" ++
+    "const row=(ref,label,now)=>{const div=document.createElement('div');" ++
+    "const rf=document.createElement('input');rf.type='radio';rf.name='atelier-dfrom';rf.title='diff from';" ++
+    "const rt=document.createElement('input');rt.type='radio';rt.name='atelier-dto';rt.title='diff to';" ++
+    "rf.checked=sel.from===ref;rt.checked=sel.to===ref;" ++
+    "rf.onchange=()=>{sel.from=ref;sync();};rt.onchange=()=>{sel.to=ref;sync();};" ++
+    "const a=document.createElement('a');a.href=ref==='current'?path:'/@'+ref+path;" ++
+    "a.textContent=label;if(now)a.className='now';" ++
+    "div.append(rf,rt,a);panel.appendChild(div);};" ++
+    "row('current','current',!pin);" ++
+    "list.forEach(c=>row(c.sha,c.date+'  '+c.subject+'  '+c.sha,pin===c.sha));" ++
+    "panel.appendChild(go);sync();" ++
     "chip.onclick=()=>{panel.style.display=panel.style.display==='block'?'none':'block';};" ++
     "}).catch(()=>{});" ++
     "})();</script>";
+
+/// The style block of the diff shell page: deliberately brand-neutral
+/// (the binary carries no brand), monospace, dark-aware. The rendered
+/// diff itself is styled by the vendored renderer inside its shadow DOM.
+const diff_page_css = ":root{color-scheme:light dark}" ++
+    "body{margin:0;background:#fff;color:#1b1a17;font:12px/1.5 ui-monospace,monospace}" ++
+    "@media(prefers-color-scheme:dark){body{background:#16130f;color:#eee}}" ++
+    "header{display:flex;gap:16px;align-items:center;padding:12px 16px;" ++
+    "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase}" ++
+    "header a{color:inherit;text-decoration:none;opacity:.75}header a:hover{opacity:1}" ++
+    "#diff-pair{opacity:.55}" ++
+    "#diff-toggle{margin-left:auto;font:inherit;letter-spacing:inherit;text-transform:inherit;" ++
+    "color:inherit;background:none;border:1px solid currentColor;opacity:.55;" ++
+    "padding:6px 10px;border-radius:2px;cursor:pointer}#diff-toggle:hover{opacity:1}" ++
+    "#diff-root{padding:0 16px 16px}";
+
+/// The module script of the diff shell page: reads the embedded JSON,
+/// renders via the vendored bundle, and re-renders on the split/unified
+/// toggle (the renderer has no restyle-in-place API, so a fresh instance
+/// per toggle is the supported path).
+const diff_page_js = "import{DEFAULT_THEMES,DIFFS_TAG_NAME,FileDiff}from'/__assets/diffs.js';" ++
+    "const d=JSON.parse(document.getElementById('diff-data').textContent);" ++
+    "const root=document.getElementById('diff-root');let style='split';" ++
+    "const render=()=>{root.textContent='';" ++
+    "const fd=new FileDiff({theme:DEFAULT_THEMES,diffStyle:style,diffIndicators:'bars',overflow:'wrap'});" ++
+    "const c=document.createElement(DIFFS_TAG_NAME);root.appendChild(c);" ++
+    "fd.render({oldFile:{name:d.name,contents:d.old},newFile:{name:d.name,contents:d.new},fileContainer:c});};" ++
+    "render();" ++
+    "document.getElementById('diff-toggle').onclick=e=>{" ++
+    "style=style==='split'?'unified':'split';" ++
+    "e.target.textContent=style==='split'?'unified':'split';render();};";
+
+/// Renders the diff shell page for `rel` comparing `from` to `to` (each a
+/// sha or `current`, already validated by `mapPath`). Both versions are
+/// embedded as JSON with angle brackets escaped, so page content cannot
+/// break out of the data element; `rel` is HTML-escaped where it appears
+/// as text. Caller owns the returned buffer.
+pub fn renderDiffPage(
+    alloc: std.mem.Allocator,
+    rel: []const u8,
+    from: []const u8,
+    to: []const u8,
+    old_content: []const u8,
+    new_content: []const u8,
+) ![]u8 {
+    std.debug.assert(rel.len > 0);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "<!doctype html><html><head><meta charset=\"utf-8\">" ++
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>diff \u{b7} ");
+    try appendHtmlEscaped(&out, alloc, rel);
+    try out.appendSlice(alloc, "</title><style>" ++ diff_page_css ++ "</style></head><body><header>" ++
+        "<a id=\"diff-back\" href=\"");
+    const page_path = try relToPagePath(alloc, rel);
+    defer alloc.free(page_path);
+    try appendHtmlEscaped(&out, alloc, page_path);
+    try out.appendSlice(alloc, "\">&larr; ");
+    try appendHtmlEscaped(&out, alloc, rel);
+    try out.appendSlice(alloc, "</a><span id=\"diff-pair\">");
+    try out.appendSlice(alloc, from);
+    try out.appendSlice(alloc, " &rarr; ");
+    try out.appendSlice(alloc, to);
+    try out.appendSlice(alloc, "</span><button id=\"diff-toggle\">unified</button></header>" ++
+        "<div id=\"diff-root\"></div><script type=\"application/json\" id=\"diff-data\">{\"name\":");
+    try history.appendJsonString(&out, alloc, rel);
+    try out.appendSlice(alloc, ",\"old\":");
+    try history.appendJsonString(&out, alloc, old_content);
+    try out.appendSlice(alloc, ",\"new\":");
+    try history.appendJsonString(&out, alloc, new_content);
+    try out.appendSlice(alloc, "}</script><script type=\"module\">" ++ diff_page_js ++
+        "</script></body></html>");
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Maps a library-relative file path back to its clean URL: the inverse
+/// of `relFromPath` for pages (`index.html` is `/`, `.html` drops).
+fn relToPagePath(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
+    std.debug.assert(rel.len > 0);
+    std.debug.assert(!std.fs.path.isAbsolute(rel));
+    if (std.mem.eql(u8, rel, "index.html")) return try alloc.dupe(u8, "/");
+    if (std.mem.endsWith(u8, rel, ".html")) {
+        return try std.fmt.allocPrint(alloc, "/{s}", .{rel[0 .. rel.len - ".html".len]});
+    }
+    return try std.fmt.allocPrint(alloc, "/{s}", .{rel});
+}
+
+/// Appends `s` with the four HTML-significant characters replaced by
+/// entities, for embedding untrusted text in element content or a
+/// double-quoted attribute.
+fn appendHtmlEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '&' => try out.appendSlice(alloc, "&amp;"),
+        '<' => try out.appendSlice(alloc, "&lt;"),
+        '>' => try out.appendSlice(alloc, "&gt;"),
+        '"' => try out.appendSlice(alloc, "&quot;"),
+        else => try out.append(alloc, c),
+    };
+}
 
 /// Inserts `payload` immediately before the LAST `</body>` in `html`, or
 /// appends it at the end when there is no `</body>` at all. Caller owns
@@ -546,6 +757,49 @@ test "mapPath history routes normalize the page path" {
     try t.expect((try mapPath(t.allocator, "/__history/../x")) == .bad);
 }
 
+test "mapPath diff routes carry rel, from, and to in either order" {
+    const cases = [_]struct { in: []const u8, rel: []const u8, from: []const u8, to: []const u8 }{
+        .{ .in = "/__diff/foo?from=abc1234&to=current", .rel = "foo.html", .from = "abc1234", .to = "current" },
+        .{ .in = "/__diff/a/b?to=def5678&from=abc1234", .rel = "a/b.html", .from = "abc1234", .to = "def5678" },
+        .{ .in = "/__diff/foo?from=current&to=abc1234", .rel = "foo.html", .from = "current", .to = "abc1234" },
+    };
+    for (cases) |c| {
+        const route = try mapPath(t.allocator, c.in);
+        try t.expect(route == .diff);
+        defer t.allocator.free(route.diff.rel);
+        defer t.allocator.free(route.diff.from);
+        defer t.allocator.free(route.diff.to);
+        try t.expectEqualStrings(c.rel, route.diff.rel);
+        try t.expectEqualStrings(c.from, route.diff.from);
+        try t.expectEqualStrings(c.to, route.diff.to);
+    }
+}
+
+test "mapPath rejects diff routes without a valid version pair" {
+    // Negative space: no query, one side missing, non-sha refs, traversal.
+    try t.expect((try mapPath(t.allocator, "/__diff/foo")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/__diff/foo?from=abc1234")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/__diff/foo?to=current")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/__diff/foo?from=nope&to=current")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/__diff/foo?from=abc1234&to=Current")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/__diff/../x?from=abc1234&to=current")) == .bad);
+}
+
+test "mapPath routes the vendored bundle and nothing else under __assets" {
+    try t.expect((try mapPath(t.allocator, "/__assets/diffs.js")) == .diffs_bundle);
+    const other = try mapPath(t.allocator, "/__assets/other.js");
+    try t.expect(other == .file);
+    t.allocator.free(other.file);
+}
+
+test "queryParam finds values by name and misses cleanly" {
+    try t.expectEqualStrings("abc", queryParam("from=abc&to=xyz", "from").?);
+    try t.expectEqualStrings("xyz", queryParam("from=abc&to=xyz", "to").?);
+    try t.expect(queryParam("from=abc", "to") == null);
+    try t.expect(queryParam("", "from") == null);
+    try t.expect(queryParam("fromage=abc", "from") == null);
+}
+
 test "contentType" {
     try t.expectEqualStrings("text/html; charset=utf-8", contentType("x.html"));
     try t.expectEqualStrings("image/svg+xml", contentType("a/b.svg"));
@@ -572,6 +826,36 @@ test "history snippet wires the fetch, snapshot links, and print hiding" {
     try t.expect(std.mem.indexOf(u8, history_snippet, "'/@'+") != null);
     try t.expect(std.mem.indexOf(u8, history_snippet, "@media print") != null);
     try t.expect(std.mem.indexOf(u8, history_snippet, "location.pathname") != null);
+}
+
+test "history snippet carries the diff picker" {
+    try t.expect(std.mem.indexOf(u8, history_snippet, "atelier-dfrom") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "atelier-dto") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "atelier-diff-go") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "'/__diff'") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "'current'") != null);
+}
+
+test "renderDiffPage embeds both versions and wires the bundle" {
+    const page = try renderDiffPage(t.allocator, "foo.html", "abc1234", "current", "<p>old</p>", "<p>new</p>");
+    defer t.allocator.free(page);
+    try t.expect(std.mem.indexOf(u8, page, "'/__assets/diffs.js'") != null);
+    try t.expect(std.mem.indexOf(u8, page, "id=\"diff-data\"") != null);
+    // Contents are embedded JSON-escaped, angle brackets defused.
+    try t.expect(std.mem.indexOf(u8, page, "\\u003cp\\u003eold\\u003c/p\\u003e") != null);
+    try t.expect(std.mem.indexOf(u8, page, "\\u003cp\\u003enew\\u003c/p\\u003e") != null);
+    try t.expect(std.mem.indexOf(u8, page, "abc1234") != null);
+    try t.expect(std.mem.indexOf(u8, page, "current") != null);
+    // The back link is the page's clean URL.
+    try t.expect(std.mem.indexOf(u8, page, "href=\"/foo\"") != null);
+    // Raw page content must never appear unescaped.
+    try t.expect(std.mem.indexOf(u8, page, "<p>old</p>") == null);
+}
+
+test "renderDiffPage back link for the index page is the root" {
+    const page = try renderDiffPage(t.allocator, "index.html", "abc1234", "current", "a", "b");
+    defer t.allocator.free(page);
+    try t.expect(std.mem.indexOf(u8, page, "href=\"/\"") != null);
 }
 
 test "injectSnippet before closing body" {

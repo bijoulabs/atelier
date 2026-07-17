@@ -68,16 +68,28 @@ pub fn renderJson(alloc: std.mem.Allocator, commits: []const Commit) ![]u8 {
     return json;
 }
 
+/// Appends `s` to `out` as a complete quoted JSON string. The escaping
+/// (see `appendJsonEscaped`) also covers `<` and `>`, so the result is
+/// safe to embed inside an HTML `<script>` element: a literal
+/// `</script>` in `s` cannot terminate the element early.
+pub fn appendJsonString(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try out.append(alloc, '"');
+    try appendJsonEscaped(out, alloc, s);
+    try out.append(alloc, '"');
+}
+
 /// Appends `s` to `out` as JSON string content: `"` and `\` get a
-/// backslash escape, control characters become `\u00XX`, everything else
-/// passes through byte for byte (UTF-8 is valid JSON as-is). Hand-rolled
-/// on purpose: the three escapes above are the whole JSON string grammar
-/// we need, and `std.json`'s API churns across dev versions.
+/// backslash escape, control characters and angle brackets become
+/// `\u00XX` (angle brackets so the output can sit inside `<script>`,
+/// see `appendJsonString`), everything else passes through byte for
+/// byte (UTF-8 is valid JSON as-is). Hand-rolled on purpose: these few
+/// escapes are the whole JSON string grammar we need, and `std.json`'s
+/// API churns across dev versions.
 fn appendJsonEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| switch (c) {
         '"' => try out.appendSlice(alloc, "\\\""),
         '\\' => try out.appendSlice(alloc, "\\\\"),
-        0x00...0x1f => {
+        0x00...0x1f, '<', '>' => {
             var buf: [6]u8 = undefined;
             const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
             std.debug.assert(esc.len == 6);
@@ -217,6 +229,13 @@ test "renderJson escapes quotes, backslashes, and control characters" {
             "\"subject\":\"say \\\"hi\\\" \\\\ back\\u0009tab\\u000anl\"}]",
         json,
     );
+}
+
+test "appendJsonString quotes, escapes, and defuses script closers" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    try appendJsonString(&out, t.allocator, "a\"b</script><i>");
+    try t.expectEqualStrings("\"a\\\"b\\u003c/script\\u003e\\u003ci\\u003e\"", out.items);
 }
 
 test "renderJson of no commits is an empty array" {
