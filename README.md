@@ -12,7 +12,7 @@ confidential in it.
     atelier pdf <page> [-o out.pdf]                        render via headless Chromium
     atelier check [page]                                   lint against the brand and structure
     atelier share <page> [--for X] [-o out.pdf]            stamped PDF export + share log
-    atelier serve [path] [--port N] [--no-reload]          static server, hot reload, auto-index
+    atelier serve [path] [--port N] [--no-reload]          static server, hot reload, auto-index, time travel
 
 ## Library contract
 
@@ -60,6 +60,17 @@ is a deliberate sub-brand and skips the style warnings only.
 Check rules are opinionated by default and configurable via an optional
 `check` object in `atelier.json`: `{ "check": { "forbid_em_dash": false } }`
 disables the em dash error.
+
+### Time travel
+
+When the library is a git repository, every page served by `atelier serve`
+carries a history chip (top right, hidden in print) listing the commits
+that touched that page. Picking one re-renders the page as of that commit
+under a `/@<sha>/` URL prefix; because the prefix is part of the path,
+every relative asset and link the page requests resolves from the same
+commit, a faithful whole-tree snapshot. Snapshots are read straight from
+git, never written to disk, and skip hot reload; the working tree stays
+the default view. History stops at a page's last rename.
 
 ### Page metadata
 

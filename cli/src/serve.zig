@@ -1,17 +1,32 @@
 const std = @import("std");
 const library = @import("library.zig");
 const index = @import("index.zig");
+const history = @import("history.zig");
 
-pub const Route = union(enum) { file: []const u8, reload, bad };
+pub const Route = union(enum) {
+    file: []const u8,
+    snapshot: Snapshot,
+    history: []const u8,
+    reload,
+    bad,
+
+    /// A whole-tree time-travel view: `rel` resolved against the library
+    /// as of commit `sha` instead of the working tree.
+    pub const Snapshot = struct { sha: []const u8, rel: []const u8 };
+};
 
 /// Maps an HTTP request target to a `Route`. Pure and testable: strips a
 /// trailing `?query`, routes `/__reload` to `.reload`, rejects backslashes
-/// and any `..` path segment as `.bad`, maps `/` to `index.html`, and
-/// otherwise resolves to the target relative to the library root, appending
-/// `.html` when the last path segment has no extension of its own.
+/// and any `..` path segment as `.bad`, then peels the two prefixed route
+/// families (`/__history/<page>` to `.history`, `/@<sha>/<page>` to
+/// `.snapshot` when `<sha>` is 7 to 40 hex digits) before resolving
+/// everything else to a working-tree `.file`. All three page-carrying
+/// routes share `relFromPath`'s clean-URL rules, so `/@<sha>/foo` pins
+/// exactly the page `/foo` names live.
 ///
-/// The returned `.file` slice is heap-allocated with `alloc`; callers own
-/// it. `.reload` and `.bad` allocate nothing.
+/// The returned `.file`/`.history` slices and both `.snapshot` fields are
+/// heap-allocated with `alloc`; callers own them. `.reload` and `.bad`
+/// allocate nothing.
 pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     var target = raw_target;
     if (std.mem.indexOfScalar(u8, target, '?')) |q| target = target[0..q];
@@ -20,19 +35,41 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     if (!std.mem.startsWith(u8, target, "/")) return .bad;
     var it = std.mem.splitScalar(u8, target[1..], '/');
     while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return .bad;
-    const file = if (std.mem.eql(u8, target, "/"))
+    if (std.mem.startsWith(u8, target, "/__history/")) {
+        return .{ .history = try relFromPath(alloc, target["/__history".len..]) };
+    }
+    if (std.mem.startsWith(u8, target, "/@")) {
+        const after = target[2..];
+        const cut = std.mem.indexOfScalar(u8, after, '/') orelse after.len;
+        const sha = after[0..cut];
+        if (!history.isCommitSha(sha)) return .bad;
+        const rest = if (cut == after.len) "/" else after[cut..];
+        const rel = try relFromPath(alloc, rest);
+        errdefer alloc.free(rel);
+        return .{ .snapshot = .{ .sha = try alloc.dupe(u8, sha), .rel = rel } };
+    }
+    return .{ .file = try relFromPath(alloc, target) };
+}
+
+/// Maps an absolute URL path (leading `/`, already traversal-checked by
+/// `mapPath`) to a library-relative file path: `/` means `index.html`,
+/// and a last segment with no extension of its own gets `.html` appended
+/// (clean URLs). Heap-allocated with `alloc`; the caller owns the result.
+fn relFromPath(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    std.debug.assert(std.mem.startsWith(u8, path, "/"));
+    const out = if (std.mem.eql(u8, path, "/"))
         try alloc.dupe(u8, "index.html")
     else blk: {
-        const rel = target[1..];
+        const rel = path[1..];
         const last = std.fs.path.basename(rel);
         if (std.mem.indexOfScalar(u8, last, '.') != null) break :blk try alloc.dupe(u8, rel);
         break :blk try std.fmt.allocPrint(alloc, "{s}.html", .{rel});
     };
-    // Negative space: the rejects above make an empty or absolute result
+    // Negative space: mapPath's rejects make an empty or absolute result
     // impossible, and the join in handleConn depends on that.
-    std.debug.assert(file.len > 0);
-    std.debug.assert(!std.fs.path.isAbsolute(file));
-    return .{ .file = file };
+    std.debug.assert(out.len > 0);
+    std.debug.assert(!std.fs.path.isAbsolute(out));
+    return out;
 }
 
 /// Maps a file's extension to a MIME type; unrecognized extensions (or
@@ -144,6 +181,27 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
     const route = mapPath(a, target) catch return;
     switch (route) {
         .bad => return writeBody(stream, io, "400 Bad Request", "text/plain", "bad path\n"),
+        .history => |rel| {
+            const commits = history.pageLog(a, io, root, rel);
+            const json = history.renderJson(a, commits) catch return;
+            return writeBody(stream, io, "200 OK", "application/json", json);
+        },
+        .snapshot => |snap| {
+            const body = history.showFile(a, io, root, snap.sha, snap.rel, file_bytes_max) orelse {
+                return writeBody(stream, io, "404 Not Found", "text/plain", "not found\n");
+            };
+            const is_html = std.mem.eql(u8, std.fs.path.extension(snap.rel), ".html");
+            if (is_html and !std.mem.eql(u8, snap.rel, "index.html")) {
+                var page = body;
+                page = injectAtBodyEnd(a, page, home_snippet) catch page;
+                page = injectAtBodyEnd(a, page, history_snippet) catch page;
+                // No reload snippet: a snapshot is immutable, and a tab
+                // pinned to one should not refresh out from under the
+                // viewer when the working tree changes.
+                return writeBody(stream, io, "200 OK", contentType(snap.rel), page);
+            }
+            return writeBody(stream, io, "200 OK", contentType(snap.rel), body);
+        },
         .reload => {
             if (!reload) return writeBody(stream, io, "404 Not Found", "text/plain", "not found\n");
             var hdr_buf: [128]u8 = undefined;
@@ -161,8 +219,13 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
             const is_html = std.mem.eql(u8, std.fs.path.extension(rel), ".html");
             if (is_html) {
                 var page = body;
-                // Navigation back to the index on every page except the index itself.
-                if (!std.mem.eql(u8, rel, "index.html")) page = injectAtBodyEnd(a, page, home_snippet) catch page;
+                // Navigation back to the index, and the page's own time
+                // travel, on every page except the index itself (whose
+                // regenerated file history is noise, not authorship).
+                if (!std.mem.eql(u8, rel, "index.html")) {
+                    page = injectAtBodyEnd(a, page, home_snippet) catch page;
+                    page = injectAtBodyEnd(a, page, history_snippet) catch page;
+                }
                 if (reload) page = injectSnippet(a, page) catch page;
                 return writeBody(stream, io, "200 OK", contentType(rel), page);
             }
@@ -218,6 +281,44 @@ pub const home_snippet = "<style>@media print{#atelier-home{display:none}}</styl
     "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
     "text-decoration:none;color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px\">" ++
     "&larr; Atelier</a>";
+
+/// The time-travel widget injected at serve time into every non-index
+/// HTML page, live or snapshot (never written to files, the same contract
+/// as the reload and home snippets). A chip in the top right, mirroring
+/// the home chip's brand-neutral look on the left, that fetches the
+/// page's commit list from `/__history<path>` and stays hidden when the
+/// list comes back empty (no git, no repo, no history). Clicking it opens
+/// a panel of commits; picking one navigates to `/@<sha><path>`, whose
+/// path prefix keeps every relative asset request inside the same
+/// snapshot. On a snapshot view the chip shows the pinned sha (and
+/// renders even with an empty list, so the way back to `current` never
+/// disappears). Subjects go through `textContent`, never innerHTML.
+pub const history_snippet = "<style>@media print{#atelier-history,#atelier-history-panel{display:none}}" ++
+    "#atelier-history{position:fixed;top:14px;right:14px;z-index:9999;display:none;" ++
+    "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
+    "color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px;cursor:pointer}" ++
+    "#atelier-history-panel{position:fixed;top:40px;right:14px;z-index:9999;display:none;" ++
+    "max-height:60vh;overflow:auto;min-width:260px;background:rgba(20,18,15,.92);" ++
+    "font:11px/1.5 ui-monospace,monospace;padding:6px 0;border-radius:2px}" ++
+    "#atelier-history-panel a{display:block;padding:5px 12px;color:#fff;text-decoration:none;white-space:nowrap}" ++
+    "#atelier-history-panel a:hover{background:rgba(255,255,255,.12)}" ++
+    "#atelier-history-panel a.now{opacity:.55}</style>" ++
+    "<div id=\"atelier-history\"></div><div id=\"atelier-history-panel\"></div>" ++
+    "<script>(()=>{" ++
+    "const m=location.pathname.match(/^\\/@([0-9a-fA-F]{7,40})(\\/.*)?$/);" ++
+    "const pin=m?m[1]:null;const path=m?(m[2]||'/'):location.pathname;" ++
+    "const chip=document.getElementById('atelier-history');" ++
+    "const panel=document.getElementById('atelier-history-panel');" ++
+    "fetch('/__history'+path).then(r=>r.json()).then(list=>{" ++
+    "if(!list.length&&!pin)return;" ++
+    "chip.textContent=pin?'\\u23f1 '+pin:'history';chip.style.display='block';" ++
+    "const add=(href,label,now)=>{const a=document.createElement('a');" ++
+    "a.href=href;a.textContent=label;if(now)a.className='now';panel.appendChild(a);};" ++
+    "add(path,'current',!pin);" ++
+    "list.forEach(c=>add('/@'+c.sha+path,c.date+'  '+c.subject+'  '+c.sha,pin===c.sha));" ++
+    "chip.onclick=()=>{panel.style.display=panel.style.display==='block'?'none':'block';};" ++
+    "}).catch(()=>{});" ++
+    "})();</script>";
 
 /// Inserts `payload` immediately before the LAST `</body>` in `html`, or
 /// appends it at the end when there is no `</body>` at all. Caller owns
@@ -398,6 +499,53 @@ test "mapPath reload and traversal" {
     try t.expect((try mapPath(t.allocator, "/a\\b")) == .bad);
 }
 
+test "mapPath snapshot routes pin a sha and keep clean-URL rules" {
+    const cases = [_]struct { in: []const u8, sha: []const u8, rel: []const u8 }{
+        .{ .in = "/@abc1234/foo", .sha = "abc1234", .rel = "foo.html" },
+        .{ .in = "/@abc1234/", .sha = "abc1234", .rel = "index.html" },
+        .{ .in = "/@abc1234", .sha = "abc1234", .rel = "index.html" },
+        .{ .in = "/@abc1234/css/site.css", .sha = "abc1234", .rel = "css/site.css" },
+        .{ .in = "/@abc1234/a/b?x=1", .sha = "abc1234", .rel = "a/b.html" },
+        .{
+            .in = "/@0123456789abcdef0123456789abcdef01234567/p",
+            .sha = "0123456789abcdef0123456789abcdef01234567",
+            .rel = "p.html",
+        },
+    };
+    for (cases) |c| {
+        const route = try mapPath(t.allocator, c.in);
+        try t.expect(route == .snapshot);
+        defer t.allocator.free(route.snapshot.sha);
+        defer t.allocator.free(route.snapshot.rel);
+        try t.expectEqualStrings(c.sha, route.snapshot.sha);
+        try t.expectEqualStrings(c.rel, route.snapshot.rel);
+    }
+}
+
+test "mapPath rejects snapshot targets that are not commit shas" {
+    // Negative space: short, non-hex, empty sha, traversal inside a pin.
+    try t.expect((try mapPath(t.allocator, "/@abc123/x")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/@zzz9999/x")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/@/x")) == .bad);
+    try t.expect((try mapPath(t.allocator, "/@abc1234/../x")) == .bad);
+}
+
+test "mapPath history routes normalize the page path" {
+    const cases = [_]struct { in: []const u8, rel: []const u8 }{
+        .{ .in = "/__history/foo", .rel = "foo.html" },
+        .{ .in = "/__history/advisory/one", .rel = "advisory/one.html" },
+        .{ .in = "/__history/logo.png", .rel = "logo.png" },
+        .{ .in = "/__history/", .rel = "index.html" },
+    };
+    for (cases) |c| {
+        const route = try mapPath(t.allocator, c.in);
+        try t.expect(route == .history);
+        defer t.allocator.free(route.history);
+        try t.expectEqualStrings(c.rel, route.history);
+    }
+    try t.expect((try mapPath(t.allocator, "/__history/../x")) == .bad);
+}
+
 test "contentType" {
     try t.expectEqualStrings("text/html; charset=utf-8", contentType("x.html"));
     try t.expectEqualStrings("image/svg+xml", contentType("a/b.svg"));
@@ -415,6 +563,15 @@ test "home snippet links to the index and hides in print" {
     try t.expect(std.mem.indexOf(u8, home_snippet, "href=\"/\"") != null);
     try t.expect(std.mem.indexOf(u8, home_snippet, "id=\"atelier-home\"") != null);
     try t.expect(std.mem.indexOf(u8, home_snippet, "@media print") != null);
+}
+
+test "history snippet wires the fetch, snapshot links, and print hiding" {
+    try t.expect(std.mem.indexOf(u8, history_snippet, "id=\"atelier-history\"") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "id=\"atelier-history-panel\"") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "'/__history'") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "'/@'+") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "@media print") != null);
+    try t.expect(std.mem.indexOf(u8, history_snippet, "location.pathname") != null);
 }
 
 test "injectSnippet before closing body" {

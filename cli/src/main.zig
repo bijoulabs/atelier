@@ -530,6 +530,7 @@ test {
     _ = @import("index.zig");
     _ = @import("pdf.zig");
     _ = @import("serve.zig");
+    _ = @import("history.zig");
     _ = @import("check.zig");
     _ = @import("share.zig");
 }
