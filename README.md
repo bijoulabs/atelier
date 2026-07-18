@@ -25,10 +25,22 @@ nearest ancestor with `atelier.json`, then `library=` in `~/.config/atelier/conf
 
 ### Theming
 
-The index page's branding comes from an optional `theme` object in
-`atelier.json`; every field defaults to a neutral look with no external
-requests. Colors are CSS color values, fonts are CSS font-family stacks,
-`font_link` is a stylesheet URL (emitted as a `<link>` when set):
+The index page's branding comes from the `theme` value in `atelier.json`,
+which takes three forms. A name adopts a theme wholesale:
+
+    "theme": "porcelain"
+
+Names resolve to `<library>/themes/<name>.json` first, then to the
+presets built into the binary (`gallery`, `ledger`, `noir`, `porcelain`,
+`terminal`), so dropping a same-named file into `themes/` forks a preset.
+A base plus overrides is the one-line brand customization:
+
+    "theme": { "base": "porcelain", "accent": "#0b5d3b" }
+
+And a plain object still works as it always has; every field defaults to
+a neutral look with no external requests. Colors are CSS color values,
+fonts are CSS font-family stacks, `font_link` is a stylesheet URL
+(emitted as a `<link>` when set):
 
     "theme": {
       "paper": "#FFFCF8", "ink": "#1b1a17",
@@ -37,6 +49,20 @@ requests. Colors are CSS color values, fonts are CSS font-family stacks,
       "mono_font": "'JetBrains Mono',ui-monospace,monospace",
       "font_link": "https://fonts.googleapis.com/css2?family=..."
     }
+
+Theme files in `themes/` are that same object as a standalone JSON file
+(no `base` in files; composition lives in the manifest). `atelier theme
+list` shows every available theme and which is active; `atelier theme
+show <name>` prints one to copy as a starting point.
+
+While `atelier serve` runs, `/__theme` is a live theme editor: pick a
+starting point, adjust colors and fonts while the real index previews
+alongside, and save to `themes/<name>.json`. Saving is the server's one
+non-GET endpoint, narrowly scoped: it validates the name (`[a-z0-9-]`,
+so it cannot write outside `themes/`), caps sizes, and touches nothing
+else. Adopting the saved theme is still a one-line manifest edit, shown
+after each save; with hot reload on, the index recolors on the next scan
+tick without a restart.
 
 The wordmark accents the first comma of `name` with the theme's accent
 color (invisible under the neutral theme, whose accent equals the ink).

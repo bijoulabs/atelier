@@ -6,6 +6,7 @@ const pdf = @import("pdf.zig");
 const serve = @import("serve.zig");
 const check = @import("check.zig");
 const share = @import("share.zig");
+const theme = @import("theme.zig");
 
 pub const version = "0.1.0";
 
@@ -22,7 +23,8 @@ const usage_text = "atelier " ++ version ++ "\n" ++
     "  atelier pdf <page> [-o out.pdf] [--rev <sha>] [--library <path>]\n" ++
     "  atelier check [page] [--library <path>]\n" ++
     "  atelier share <page> [--for <recipient>] [-o out.pdf] [--library <path>]\n" ++
-    "  atelier serve [path] [--port N] [--no-reload] [--library <path>]\n";
+    "  atelier serve [path] [--port N] [--no-reload] [--library <path>]\n" ++
+    "  atelier theme list|show <name> [--library <path>]\n";
 
 fn usage(io: std.Io, code: u8) noreturn {
     const w = if (code == 0) std.Io.File.stdout() else std.Io.File.stderr();
@@ -50,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdShare(arena, io, init.environ_map, args);
     } else if (std.mem.eql(u8, cmd, "serve")) {
         try cmdServe(arena, io, init.environ_map, args);
+    } else if (std.mem.eql(u8, cmd, "theme")) {
+        try cmdTheme(arena, io, init.environ_map, args);
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         usage(io, 0);
     } else {
@@ -478,6 +482,87 @@ fn cmdServe(
     try serve.run(io, lib, port, reload);
 }
 
+/// Implements `atelier theme list|show <name> [--library <path>]`.
+///
+/// `list` prints the built-in presets and the library's own `themes/`
+/// files, marking which name the manifest currently adopts and which
+/// presets a library file shadows. `show` prints one theme's JSON, the
+/// exact content a `themes/<name>.json` file holds, to copy as a
+/// starting point. Both write to stdout; this output is for piping.
+fn cmdTheme(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    args: []const [:0]const u8,
+) !void {
+    if (args.len < 3) usage(io, 1);
+    const sub = args[2];
+
+    if (std.mem.eql(u8, sub, "show")) {
+        if (args.len < 4) usage(io, 1);
+        const lib = try resolveFromArgs(alloc, io, environ, args, null);
+        const shown = theme.resolveNamed(alloc, io, lib.root, args[3]) catch |e| switch (e) {
+            error.UnknownTheme => {
+                std.debug.print("unknown theme: {s}; run `atelier theme list`\n", .{args[3]});
+                std.process.exit(1);
+            },
+            else => return e,
+        };
+        const rendered = try theme.renderThemeJson(alloc, shown);
+        try std.Io.File.stdout().writeStreamingAll(io, rendered);
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "list")) usage(io, 1);
+    const lib = try resolveFromArgs(alloc, io, environ, args, null);
+
+    // The adopted name, when the manifest's theme is a plain string.
+    var active: []const u8 = "";
+    const manifest_path = try std.fs.path.join(alloc, &.{ lib.root, "atelier.json" });
+    if (std.Io.Dir.cwd().readFileAlloc(io, manifest_path, alloc, .limited(64 * 1024))) |raw| {
+        if (std.json.parseFromSlice(std.json.Value, alloc, raw, .{})) |parsed| {
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("theme")) |v| {
+                    if (v == .string) active = try alloc.dupe(u8, v.string);
+                }
+            }
+        } else |_| {}
+    } else |_| {}
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, "built-in presets:\n");
+    for (theme.preset_names) |name| {
+        const file_path = try std.fmt.allocPrint(alloc, "{s}/themes/{s}.json", .{ lib.root, name });
+        const shadowed = if (std.Io.Dir.cwd().statFile(io, file_path, .{})) |_| true else |_| false;
+        try out.appendSlice(alloc, "  ");
+        try out.appendSlice(alloc, name);
+        if (std.mem.eql(u8, name, active) and !shadowed) try out.appendSlice(alloc, "  (active)");
+        if (shadowed) try out.appendSlice(alloc, "  (shadowed by library)");
+        try out.appendSlice(alloc, "\n");
+    }
+    try out.appendSlice(alloc, "library themes/:\n");
+    const themes_dir = try std.fs.path.join(alloc, &.{ lib.root, "themes" });
+    var listed_any = false;
+    if (std.Io.Dir.openDirAbsolute(io, themes_dir, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+            const name = entry.name[0 .. entry.name.len - ".json".len];
+            if (!theme.isThemeName(name)) continue;
+            try out.appendSlice(alloc, "  ");
+            try out.appendSlice(alloc, name);
+            if (std.mem.eql(u8, name, active)) try out.appendSlice(alloc, "  (active)");
+            try out.appendSlice(alloc, "\n");
+            listed_any = true;
+        }
+    } else |_| {}
+    if (!listed_any) try out.appendSlice(alloc, "  (none; save one from the editor at /__theme while serving)\n");
+    try std.Io.File.stdout().writeStreamingAll(io, out.items);
+}
+
 /// Scans `args` for `--library <path>`; falls back to `positional` when
 /// no flag is present. Resolves the library via `library.resolve` against
 /// the current working directory and the default config path, printing a
@@ -511,6 +596,21 @@ fn resolveFromArgs(
             std.debug.print("path is not a library: no atelier.json at the given root\n", .{});
             std.process.exit(1);
         },
+        error.UnknownTheme => {
+            std.debug.print(
+                "unknown theme in atelier.json: found neither <library>/themes/<name>.json nor a built-in preset ({s}); run `atelier theme list`\n",
+                .{theme.preset_names_joined},
+            );
+            std.process.exit(1);
+        },
+        error.NestedBase => {
+            std.debug.print("theme files must not declare \"base\"; compose base + overrides in atelier.json instead\n", .{});
+            std.process.exit(1);
+        },
+        error.BadThemeSpec => {
+            std.debug.print("bad \"theme\" in atelier.json: use an object, a theme name string, or {{\"base\":\"name\", ...overrides}}\n", .{});
+            std.process.exit(1);
+        },
         else => return e,
     };
 }
@@ -531,6 +631,8 @@ test {
     _ = @import("pdf.zig");
     _ = @import("serve.zig");
     _ = @import("history.zig");
+    _ = @import("json.zig");
+    _ = @import("theme.zig");
     _ = @import("check.zig");
     _ = @import("share.zig");
 }

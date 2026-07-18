@@ -1,0 +1,9 @@
+{
+  "paper": "#ffffff",
+  "ink": "#14171a",
+  "muted": "#5c6670",
+  "accent": "#1f5edd",
+  "rule": "#e3e7ec",
+  "display_font": "'Helvetica Neue',Helvetica,Arial,sans-serif",
+  "mono_font": "ui-monospace,monospace"
+}

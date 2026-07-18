@@ -5,6 +5,7 @@
 //! contract as `index.zig`'s revision counts.
 
 const std = @import("std");
+const json = @import("json.zig");
 
 /// One commit touching a page: abbreviated sha, short date, subject line.
 /// All fields are slices into the `git log` output they were parsed from;
@@ -52,51 +53,27 @@ pub fn renderJson(alloc: std.mem.Allocator, commits: []const Commit) ![]u8 {
     try out.append(alloc, '[');
     for (commits, 0..) |c, i| {
         if (i > 0) try out.append(alloc, ',');
-        try out.appendSlice(alloc, "{\"sha\":\"");
-        try appendJsonEscaped(&out, alloc, c.sha);
-        try out.appendSlice(alloc, "\",\"date\":\"");
-        try appendJsonEscaped(&out, alloc, c.date);
-        try out.appendSlice(alloc, "\",\"subject\":\"");
-        try appendJsonEscaped(&out, alloc, c.subject);
-        try out.appendSlice(alloc, "\"}");
+        try out.appendSlice(alloc, "{\"sha\":");
+        try json.appendString(&out, alloc, c.sha);
+        try out.appendSlice(alloc, ",\"date\":");
+        try json.appendString(&out, alloc, c.date);
+        try out.appendSlice(alloc, ",\"subject\":");
+        try json.appendString(&out, alloc, c.subject);
+        try out.appendSlice(alloc, "}");
     }
     try out.append(alloc, ']');
-    const json = try out.toOwnedSlice(alloc);
-    std.debug.assert(json.len >= 2);
-    std.debug.assert(json[0] == '[');
-    std.debug.assert(json[json.len - 1] == ']');
-    return json;
+    const rendered = try out.toOwnedSlice(alloc);
+    std.debug.assert(rendered.len >= 2);
+    std.debug.assert(rendered[0] == '[');
+    std.debug.assert(rendered[rendered.len - 1] == ']');
+    return rendered;
 }
 
-/// Appends `s` to `out` as a complete quoted JSON string. The escaping
-/// (see `appendJsonEscaped`) also covers `<` and `>`, so the result is
-/// safe to embed inside an HTML `<script>` element: a literal
-/// `</script>` in `s` cannot terminate the element early.
+/// Appends `s` to `out` as a complete quoted JSON string; see
+/// `json.appendString`, which this forwards to (kept here so history's
+/// callers read naturally).
 pub fn appendJsonString(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    try out.append(alloc, '"');
-    try appendJsonEscaped(out, alloc, s);
-    try out.append(alloc, '"');
-}
-
-/// Appends `s` to `out` as JSON string content: `"` and `\` get a
-/// backslash escape, control characters and angle brackets become
-/// `\u00XX` (angle brackets so the output can sit inside `<script>`,
-/// see `appendJsonString`), everything else passes through byte for
-/// byte (UTF-8 is valid JSON as-is). Hand-rolled on purpose: these few
-/// escapes are the whole JSON string grammar we need, and `std.json`'s
-/// API churns across dev versions.
-fn appendJsonEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try out.appendSlice(alloc, "\\\""),
-        '\\' => try out.appendSlice(alloc, "\\\\"),
-        0x00...0x1f, '<', '>' => {
-            var buf: [6]u8 = undefined;
-            const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-            std.debug.assert(esc.len == 6);
-            try out.appendSlice(alloc, esc);
-        },
-        else => try out.append(alloc, c),
-    };
+    try json.appendString(out, alloc, s);
 }
 
 /// Whether `s` is a plausible git commit sha: 7 to 40 hex digits. This is
@@ -209,12 +186,12 @@ test "renderJson renders the three fields per commit" {
         .{ .sha = "abc1234", .date = "2026-07-01", .subject = "hello" },
         .{ .sha = "def5678", .date = "2026-06-20", .subject = "world" },
     };
-    const json = try renderJson(t.allocator, &commits);
-    defer t.allocator.free(json);
+    const rendered = try renderJson(t.allocator, &commits);
+    defer t.allocator.free(rendered);
     try t.expectEqualStrings(
         "[{\"sha\":\"abc1234\",\"date\":\"2026-07-01\",\"subject\":\"hello\"}," ++
             "{\"sha\":\"def5678\",\"date\":\"2026-06-20\",\"subject\":\"world\"}]",
-        json,
+        rendered,
     );
 }
 
@@ -222,26 +199,19 @@ test "renderJson escapes quotes, backslashes, and control characters" {
     const commits = [_]Commit{
         .{ .sha = "abc1234", .date = "2026-07-01", .subject = "say \"hi\" \\ back\ttab\nnl" },
     };
-    const json = try renderJson(t.allocator, &commits);
-    defer t.allocator.free(json);
+    const rendered = try renderJson(t.allocator, &commits);
+    defer t.allocator.free(rendered);
     try t.expectEqualStrings(
         "[{\"sha\":\"abc1234\",\"date\":\"2026-07-01\"," ++
             "\"subject\":\"say \\\"hi\\\" \\\\ back\\u0009tab\\u000anl\"}]",
-        json,
+        rendered,
     );
 }
 
-test "appendJsonString quotes, escapes, and defuses script closers" {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(t.allocator);
-    try appendJsonString(&out, t.allocator, "a\"b</script><i>");
-    try t.expectEqualStrings("\"a\\\"b\\u003c/script\\u003e\\u003ci\\u003e\"", out.items);
-}
-
 test "renderJson of no commits is an empty array" {
-    const json = try renderJson(t.allocator, &.{});
-    defer t.allocator.free(json);
-    try t.expectEqualStrings("[]", json);
+    const rendered = try renderJson(t.allocator, &.{});
+    defer t.allocator.free(rendered);
+    try t.expectEqualStrings("[]", rendered);
 }
 
 test "isCommitSha accepts 7 to 40 hex digits and nothing else" {

@@ -1,0 +1,9 @@
+{
+  "paper": "#f7f3e8",
+  "ink": "#1c2420",
+  "muted": "#5f6b62",
+  "accent": "#0b5d3b",
+  "rule": "#ddd3b8",
+  "display_font": "Georgia,'Times New Roman',serif",
+  "mono_font": "ui-monospace,monospace"
+}

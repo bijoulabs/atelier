@@ -1,0 +1,9 @@
+{
+  "paper": "#0d1117",
+  "ink": "#c9d1d9",
+  "muted": "#8b949e",
+  "accent": "#3fb950",
+  "rule": "#30363d",
+  "display_font": "ui-monospace,'Cascadia Mono',monospace",
+  "mono_font": "ui-monospace,'Cascadia Mono',monospace"
+}

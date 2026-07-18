@@ -1,4 +1,5 @@
 const std = @import("std");
+const theme_mod = @import("theme.zig");
 
 /// The name of the manifest file that marks a directory as a library root.
 const manifest_file_name = "atelier.json";
@@ -9,58 +10,10 @@ const manifest_bytes_max = 64 * 1024;
 /// Upper bound on how large the `~/.config/atelier/config` file is allowed to be.
 const config_bytes_max = 4 * 1024;
 
-/// Index-page branding, set via the optional `theme` object in
-/// `atelier.json`. Every field defaults to the neutral look (`neutral`), so
-/// a library themes itself entirely through config and the binary stays
-/// free of any particular brand. Color fields are CSS color values, font
-/// fields are CSS font-family stacks, and `font_link` is a stylesheet URL
-/// emitted as a `<link>` when non-empty (empty means the page makes no
-/// external requests).
-pub const Theme = struct {
-    paper: []const u8 = "#ffffff",
-    ink: []const u8 = "#1c1c1c",
-    muted: []const u8 = "#606060",
-    accent: []const u8 = "#1c1c1c",
-    rule: []const u8 = "#dddddd",
-    display_font: []const u8 = "system-ui,sans-serif",
-    mono_font: []const u8 = "ui-monospace,monospace",
-    font_link: []const u8 = "",
-    /// Extra hex colors `atelier check` accepts beyond the five theme
-    /// colors: the brand's extended palette (shades, semantic colors).
-    palette: []const []const u8 = &.{},
-
-    /// The all-defaults theme; also what tests compare against.
-    pub const neutral = Theme{};
-
-    fn dupe(self: Theme, alloc: std.mem.Allocator) !Theme {
-        const palette = try alloc.alloc([]const u8, self.palette.len);
-        for (self.palette, 0..) |c, i| palette[i] = try alloc.dupe(u8, c);
-        return .{
-            .paper = try alloc.dupe(u8, self.paper),
-            .ink = try alloc.dupe(u8, self.ink),
-            .muted = try alloc.dupe(u8, self.muted),
-            .accent = try alloc.dupe(u8, self.accent),
-            .rule = try alloc.dupe(u8, self.rule),
-            .display_font = try alloc.dupe(u8, self.display_font),
-            .mono_font = try alloc.dupe(u8, self.mono_font),
-            .font_link = try alloc.dupe(u8, self.font_link),
-            .palette = palette,
-        };
-    }
-
-    fn deinit(self: Theme, alloc: std.mem.Allocator) void {
-        alloc.free(self.paper);
-        alloc.free(self.ink);
-        alloc.free(self.muted);
-        alloc.free(self.accent);
-        alloc.free(self.rule);
-        alloc.free(self.display_font);
-        alloc.free(self.mono_font);
-        alloc.free(self.font_link);
-        for (self.palette) |c| alloc.free(c);
-        alloc.free(self.palette);
-    }
-};
+/// Index-page branding; the struct itself now lives in `theme.zig`
+/// (named themes, presets, overlays), re-exported here so the rest of
+/// the code keeps reading `library.Theme`.
+pub const Theme = theme_mod.Theme;
 
 /// Knobs for `atelier check`, set via the optional `check` object in
 /// `atelier.json`. Defaults are opinionated; adopters opt out per rule.
@@ -99,13 +52,14 @@ pub const ResolveError = error{
 } || anyerror;
 
 /// On-disk shape of `atelier.json`. Missing fields fall back to library
-/// defaults; a missing or partial `theme` falls back to `Theme.neutral`
-/// field by field (see `Theme`'s own defaults).
+/// defaults. `theme` stays a raw JSON value here because it accepts
+/// three forms (object, name string, base-plus-overrides object);
+/// `theme.resolveSpec` interprets it during `loadAt`.
 const Manifest = struct {
     name: []const u8 = "Atelier",
     tag: []const u8 = "",
     port: u16 = 8789,
-    theme: Theme = Theme.neutral,
+    theme: std.json.Value = .null,
     check: CheckConfig = .{},
 };
 
@@ -127,12 +81,20 @@ fn loadAt(alloc: std.mem.Allocator, io: std.Io, dir_abs: []const u8) !?Library {
     const parsed = try std.json.parseFromSlice(Manifest, alloc, raw, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
 
+    // Duped one at a time with errdefers: a failing theme resolution
+    // (e.g. an unknown name) must not strand the earlier fields.
+    const root = try alloc.dupe(u8, dir_abs);
+    errdefer alloc.free(root);
+    const name = try alloc.dupe(u8, parsed.value.name);
+    errdefer alloc.free(name);
+    const tag = try alloc.dupe(u8, parsed.value.tag);
+    errdefer alloc.free(tag);
     return Library{
-        .root = try alloc.dupe(u8, dir_abs),
-        .name = try alloc.dupe(u8, parsed.value.name),
-        .tag = try alloc.dupe(u8, parsed.value.tag),
+        .root = root,
+        .name = name,
+        .tag = tag,
         .port = parsed.value.port,
-        .theme = try parsed.value.theme.dupe(alloc),
+        .theme = try theme_mod.resolveSpec(alloc, io, dir_abs, parsed.value.theme),
         .check = parsed.value.check,
     };
 }
@@ -227,6 +189,45 @@ test "manifest theme block overrides the neutral defaults" {
     // Unspecified fields keep their neutral defaults.
     try t.expectEqualStrings(Theme.neutral.ink, lib.theme.ink);
     try t.expectEqualStrings(Theme.neutral.paper, lib.theme.paper);
+}
+
+test "manifest can name a theme and gets the preset" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data =
+        \\{"name":"Acme","theme":"noir"}
+    });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const lib = try resolve(t.allocator, t.io, .{ .explicit = root, .start_dir = "/", .config_path = "/nonexistent" });
+    defer lib.deinit(t.allocator);
+    try t.expectEqualStrings("#d4a24e", lib.theme.accent);
+    try t.expectEqualStrings("#16130f", lib.theme.paper);
+}
+
+test "manifest base theme with field overrides" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data =
+        \\{"name":"Acme","theme":{"base":"ledger","accent":"#123456"}}
+    });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const lib = try resolve(t.allocator, t.io, .{ .explicit = root, .start_dir = "/", .config_path = "/nonexistent" });
+    defer lib.deinit(t.allocator);
+    try t.expectEqualStrings("#123456", lib.theme.accent);
+    try t.expectEqualStrings("#f7f3e8", lib.theme.paper);
+}
+
+test "manifest naming an unknown theme fails loudly" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data =
+        \\{"name":"Acme","theme":"no-such"}
+    });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try t.expectError(error.UnknownTheme, resolve(t.allocator, t.io, .{ .explicit = root, .start_dir = "/", .config_path = "/nonexistent" }));
 }
 
 test "manifest check block overrides the opinionated defaults" {

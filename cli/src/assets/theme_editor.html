@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Theme editor &middot; Atelier</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{display:flex;min-height:100vh;background:#14120f;color:#e8e2d8;
+    font:12px/1.5 ui-monospace,'Cascadia Mono',monospace}
+  /* The rail is the workshop wall: neutral, dim, disciplined. The only
+     color on this page belongs to the theme being made. */
+  #rail{width:320px;flex:none;display:flex;flex-direction:column;gap:0;
+    border-right:1px solid #2b2620;padding:20px 20px 28px;overflow-y:auto;max-height:100vh}
+  h1{font-size:10px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;color:#8d8478}
+  h1 b{color:#e8e2d8;font-weight:600}
+  #start{margin:18px 0 6px}
+  label,.leg{display:block;font-size:9px;font-weight:600;letter-spacing:.18em;
+    text-transform:uppercase;color:#8d8478;margin:14px 0 4px}
+  .hint{color:#5f584e;text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px}
+  select,input[type=text],textarea{width:100%;background:#1d1a15;color:#e8e2d8;
+    border:1px solid #2b2620;border-radius:2px;padding:7px 9px;font:inherit}
+  select:focus,input:focus,textarea:focus,button:focus{outline:2px solid #8d8478;outline-offset:1px}
+  .colorrow{display:flex;gap:8px;align-items:center}
+  .colorrow input[type=text]{flex:1}
+  /* The paint dab: the native picker as a round swatch of the value. */
+  input[type=color]{width:26px;height:26px;flex:none;border:1px solid #2b2620;border-radius:50%;
+    padding:0;background:none;cursor:pointer}
+  input[type=color]::-webkit-color-swatch-wrapper{padding:2px}
+  input[type=color]::-webkit-color-swatch{border:none;border-radius:50%}
+  textarea{height:64px;resize:vertical}
+  #savebar{margin-top:22px;padding-top:16px;border-top:1px solid #2b2620}
+  #saverow{display:flex;gap:8px;margin-top:4px}
+  #name{flex:1}
+  button{background:#e8e2d8;color:#14120f;border:none;border-radius:2px;padding:7px 14px;
+    font:inherit;font-weight:600;letter-spacing:.14em;text-transform:uppercase;cursor:pointer}
+  button:hover{background:#fff}
+  #status{margin-top:10px;color:#8d8478;min-height:2.8em}
+  #status code{color:#e8e2d8;background:#1d1a15;padding:1px 5px;border-radius:2px;user-select:all}
+  #status.err{color:#c96f5a}
+  #preview{flex:1;min-width:0;background:#0e0c0a}
+  #preview iframe{width:100%;height:100vh;border:0;background:#fff}
+  @media (max-width:900px){
+    body{flex-direction:column}
+    #rail{width:100%;max-height:none;border-right:0;border-bottom:1px solid #2b2620}
+    #preview iframe{height:70vh}
+  }
+</style>
+</head>
+<body>
+<div id="rail">
+  <h1><b>Theme editor</b> &middot; changes preview live, nothing is written until you save</h1>
+
+  <label for="start">Start from</label>
+  <select id="start"></select>
+
+  <span class="leg">Colors</span>
+  <div id="colors"></div>
+
+  <label for="display_font">display font<span class="hint">headings stack</span></label>
+  <input type="text" id="display_font">
+  <label for="mono_font">mono font<span class="hint">labels and code stack</span></label>
+  <input type="text" id="mono_font">
+  <label for="font_link">font link<span class="hint">optional stylesheet URL; adds an external request</span></label>
+  <input type="text" id="font_link">
+  <label for="palette">palette<span class="hint">extra allowed colors, one per line</span></label>
+  <textarea id="palette"></textarea>
+
+  <div id="savebar">
+    <label for="name">Save as</label>
+    <div id="saverow">
+      <input type="text" id="name" placeholder="my-theme">
+      <button id="save">Save theme</button>
+    </div>
+    <div id="status">Loading themes&hellip;</div>
+  </div>
+</div>
+<div id="preview"><iframe id="frame" src="/" title="library index preview"></iframe></div>
+
+<script>
+(() => {
+  'use strict';
+  // Field model: id, index-shell CSS variable, one-line meaning.
+  const COLORS = [
+    ['paper', '--paper', 'page background'],
+    ['ink', '--ink', 'text'],
+    ['muted', '--ink-3', 'secondary text'],
+    ['accent', '--accent', 'highlight'],
+    ['rule', '--rule', 'lines and borders'],
+  ];
+  const FONTS = [['display_font', '--display'], ['mono_font', '--mono']];
+  const HEX = /^#[0-9a-fA-F]{6}$/;
+
+  const el = (id) => document.getElementById(id);
+  const frame = el('frame');
+  const status = el('status');
+  let themes = {};
+
+  // Build the color rows: hex text input plus the paint-dab picker.
+  for (const [id, , meaning] of COLORS) {
+    const label = document.createElement('label');
+    label.htmlFor = id;
+    label.textContent = id;
+    const hint = document.createElement('span');
+    hint.className = 'hint';
+    hint.textContent = meaning;
+    label.appendChild(hint);
+    const row = document.createElement('div');
+    row.className = 'colorrow';
+    const text = document.createElement('input');
+    text.type = 'text';
+    text.id = id;
+    const dab = document.createElement('input');
+    dab.type = 'color';
+    dab.id = id + '-dab';
+    dab.title = id + ' picker';
+    text.addEventListener('input', () => { if (HEX.test(text.value)) dab.value = text.value; apply(); });
+    dab.addEventListener('input', () => { text.value = dab.value; apply(); });
+    row.append(text, dab);
+    el('colors').append(label, row);
+  }
+  for (const [id] of FONTS) el(id).addEventListener('input', apply);
+  el('font_link').addEventListener('input', apply);
+  el('palette').addEventListener('input', apply);
+
+  function current() {
+    const theme = {};
+    for (const [id] of COLORS) theme[id] = el(id).value.trim();
+    for (const [id] of FONTS) theme[id] = el(id).value.trim();
+    theme.font_link = el('font_link').value.trim();
+    const palette = el('palette').value.split('\n').map(s => s.trim()).filter(Boolean);
+    if (palette.length) theme.palette = palette;
+    return theme;
+  }
+
+  // Live preview: write the index shell's CSS variables into the iframe.
+  function apply() {
+    const doc = frame.contentDocument;
+    if (!doc) return;
+    const root = doc.documentElement;
+    const theme = current();
+    for (const [id, cssvar] of COLORS) if (theme[id]) root.style.setProperty(cssvar, theme[id]);
+    for (const [id, cssvar] of FONTS) if (theme[id]) root.style.setProperty(cssvar, theme[id]);
+    let link = doc.getElementById('__theme-font');
+    if (theme.font_link) {
+      if (!link) {
+        link = doc.createElement('link');
+        link.id = '__theme-font';
+        link.rel = 'stylesheet';
+        doc.head.appendChild(link);
+      }
+      if (link.href !== theme.font_link) link.href = theme.font_link;
+    } else if (link) {
+      link.remove();
+    }
+  }
+  // Hot reload replaces the iframe document (a save touches themes/);
+  // reapply the working values so the preview never snaps back.
+  frame.addEventListener('load', apply);
+
+  function fill(theme) {
+    for (const [id] of COLORS) {
+      el(id).value = theme[id] || '';
+      if (HEX.test(el(id).value)) el(id + '-dab').value = el(id).value;
+    }
+    for (const [id] of FONTS) el(id).value = theme[id] || '';
+    el('font_link').value = theme.font_link || '';
+    el('palette').value = (theme.palette || []).join('\n');
+    apply();
+  }
+
+  fetch('/__theme/data').then(r => r.json()).then(data => {
+    themes = data.themes || {};
+    const start = el('start');
+    const active = document.createElement('option');
+    active.value = '';
+    active.textContent = 'active theme';
+    start.appendChild(active);
+    for (const name of Object.keys(themes).sort()) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      start.appendChild(opt);
+    }
+    start.addEventListener('change', () => fill(start.value ? themes[start.value] : data.active));
+    fill(data.active || {});
+    status.textContent = 'Adjust fields; the index on the right follows along.';
+  }).catch(() => {
+    status.className = 'err';
+    status.textContent = 'Could not load /__theme/data.';
+  });
+
+  el('save').addEventListener('click', () => {
+    const name = el('name').value.trim();
+    status.className = '';
+    if (!/^[a-z0-9-]{1,64}$/.test(name)) {
+      status.className = 'err';
+      status.textContent = 'Theme names are 1 to 64 of a-z, 0-9, and hyphens.';
+      return;
+    }
+    fetch('/__theme/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, theme: current() }),
+    }).then(async (r) => {
+      const text = await r.text();
+      if (!r.ok) throw new Error(text.trim());
+      const path = JSON.parse(text).path;
+      status.innerHTML = '';
+      status.append('Saved ' + path + '. To adopt it, set ');
+      const code = document.createElement('code');
+      code.textContent = '"theme": "' + name + '"';
+      status.append(code, ' in atelier.json.');
+    }).catch((e) => {
+      status.className = 'err';
+      status.textContent = 'Save failed: ' + e.message;
+    });
+  });
+})();
+</script>
+</body>
+</html>

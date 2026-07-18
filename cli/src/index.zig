@@ -1290,6 +1290,25 @@ test "renderLedger skips reserved and repeated metadata keys as attributes" {
     try t.expect(std.mem.indexOf(u8, out, "second") == null);
 }
 
+test "render pins the CSS variable contract the theme editor writes to" {
+    // The /__theme editor previews by setting exactly these custom
+    // properties on :root; renaming any of them breaks it silently.
+    const lib = library.Library{
+        .root = "/x",
+        .name = "Acme",
+        .tag = "",
+        .port = 8789,
+        .theme = .{ .paper = "#fbf7f0", .accent = "#8c3a2e" },
+    };
+    const page = try render(t.allocator, lib, &.{});
+    defer t.allocator.free(page);
+    try t.expect(std.mem.indexOf(u8, page, "--paper:#fbf7f0") != null);
+    try t.expect(std.mem.indexOf(u8, page, "--accent:#8c3a2e") != null);
+    for ([_][]const u8{ "--paper:", "--ink:", "--ink-3:", "--accent:", "--rule:", "--display:", "--mono:" }) |v| {
+        try t.expect(std.mem.indexOf(u8, page, v) != null);
+    }
+}
+
 test "render emits ledger chrome: masthead count, chips, search, script" {
     const lib = library.Library{ .root = "/x", .name = "Acme", .tag = "Tag Line", .port = 8789 };
     const items = [_]Item{.{ .label = "Doc", .href = "/doc", .path = "/doc.html", .section = "advisory", .mtime_sec = 86400 }};

@@ -2,6 +2,8 @@ const std = @import("std");
 const library = @import("library.zig");
 const index = @import("index.zig");
 const history = @import("history.zig");
+const theme = @import("theme.zig");
+const json = @import("json.zig");
 
 pub const Route = union(enum) {
     file: []const u8,
@@ -9,6 +11,9 @@ pub const Route = union(enum) {
     history: []const u8,
     diff: Diff,
     diffs_bundle,
+    theme_editor,
+    theme_data,
+    theme_save,
     reload,
     bad,
 
@@ -43,6 +48,9 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     }
     if (std.mem.eql(u8, target, "/__reload")) return .reload;
     if (std.mem.eql(u8, target, "/__assets/diffs.js")) return .diffs_bundle;
+    if (std.mem.eql(u8, target, "/__theme")) return .theme_editor;
+    if (std.mem.eql(u8, target, "/__theme/data")) return .theme_data;
+    if (std.mem.eql(u8, target, "/__theme/save")) return .theme_save;
     if (std.mem.indexOfScalar(u8, target, '\\') != null) return .bad;
     if (!std.mem.startsWith(u8, target, "/")) return .bad;
     var it = std.mem.splitScalar(u8, target[1..], '/');
@@ -72,6 +80,19 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
         return .{ .snapshot = .{ .sha = try alloc.dupe(u8, sha), .rel = rel } };
     }
     return .{ .file = try relFromPath(alloc, target) };
+}
+
+/// Finds the `Content-Length` value in a raw header block (request line
+/// included), case-insensitively, or null when absent or unparsable.
+fn parseContentLength(headers: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
 }
 
 /// Finds the value of `name` in a raw query string of `a=b&c=d` pairs, or
@@ -228,20 +249,52 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    var buf: [4096]u8 = undefined;
-    var iov: [1][]u8 = .{&buf};
-    const n = stream.read(io, &iov) catch return;
-    if (n == 0) return;
-    const req = buf[0..n];
-    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return;
-    var parts = std.mem.splitScalar(u8, req[0..line_end], ' ');
+    // Bounded request read: accumulate until the blank line ends the
+    // headers or the 8 KB cap trips (a real browser request fits with
+    // room to spare; anything larger is not worth serving).
+    var buf: [8192]u8 = undefined;
+    var have: usize = 0;
+    const header_end = blk: {
+        while (true) {
+            if (std.mem.indexOf(u8, buf[0..have], "\r\n\r\n")) |at| break :blk at + 4;
+            if (have == buf.len) return;
+            var iov: [1][]u8 = .{buf[have..]};
+            const n = stream.read(io, &iov) catch return;
+            if (n == 0) return;
+            have += n;
+        }
+    };
+    const head = buf[0..header_end];
+    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse return;
+    var parts = std.mem.splitScalar(u8, head[0..line_end], ' ');
     const method = parts.next() orelse return;
     const target = parts.next() orelse return;
-    if (!std.mem.eql(u8, method, "GET")) return writeBody(stream, io, "405 Method Not Allowed", "text/plain", "GET only\n");
+    const is_post = std.mem.eql(u8, method, "POST");
+    if (!std.mem.eql(u8, method, "GET") and !is_post) {
+        return writeBody(stream, io, "405 Method Not Allowed", "text/plain", "GET only\n");
+    }
 
     const route = mapPath(a, target) catch return;
+    // POST exists for exactly one route, the theme editor's save; the
+    // server is GET-only everywhere else on purpose (an open tailnet
+    // port must not be able to modify the library beyond themes/).
+    if (is_post != (route == .theme_save)) {
+        return writeBody(stream, io, "405 Method Not Allowed", "text/plain", "wrong method\n");
+    }
     switch (route) {
         .bad => return writeBody(stream, io, "400 Bad Request", "text/plain", "bad path\n"),
+        .theme_editor => return writeBody(stream, io, "200 OK", "text/html; charset=utf-8", theme_editor_html),
+        .theme_data => return handleThemeData(a, io, root, stream),
+        .theme_save => {
+            const content_length = parseContentLength(head) orelse {
+                return writeBody(stream, io, "411 Length Required", "text/plain", "length required\n");
+            };
+            if (content_length > save_body_bytes_max) {
+                return writeBody(stream, io, "413 Content Too Large", "text/plain", "body too large\n");
+            }
+            const body = readBody(a, io, stream, buf[header_end..have], content_length) orelse return;
+            return handleThemeSave(a, io, root, stream, body);
+        },
         .diffs_bundle => {
             // The one deliberate exemption from the global no-store: the
             // bundle is immutable per binary, and it is 2.3 MB the browser
@@ -260,8 +313,8 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
         },
         .history => |rel| {
             const commits = history.pageLog(a, io, root, rel);
-            const json = history.renderJson(a, commits) catch return;
-            return writeBody(stream, io, "200 OK", "application/json", json);
+            const rendered = history.renderJson(a, commits) catch return;
+            return writeBody(stream, io, "200 OK", "application/json", rendered);
         },
         .snapshot => |snap| {
             const body = history.showFile(a, io, root, snap.sha, snap.rel, file_bytes_max) orelse {
@@ -309,6 +362,128 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
             return writeBody(stream, io, "200 OK", contentType(rel), body);
         },
     }
+}
+
+/// The theme editor page served at /__theme, our own code embedded at
+/// build time (`assets/theme_editor.html`); like every served page it
+/// makes no external requests.
+const theme_editor_html = @embedFile("assets/theme_editor.html");
+
+/// Upper bound on a theme-save request body. A full theme with a fat
+/// palette is under 4 KB; 64 KB leaves an order of magnitude of slack.
+const save_body_bytes_max = 64 * 1024;
+
+/// Reads a POST body of exactly `len` bytes: whatever arrived past the
+/// headers first (`pre`), then the socket until complete. Null on any
+/// short read; the connection just drops, like every other parse
+/// failure in `handleConn`.
+fn readBody(alloc: std.mem.Allocator, io: std.Io, stream: net.Stream, pre: []const u8, len: usize) ?[]u8 {
+    std.debug.assert(len <= save_body_bytes_max);
+    const body = alloc.alloc(u8, len) catch return null;
+    const pre_n = @min(pre.len, len);
+    @memcpy(body[0..pre_n], pre[0..pre_n]);
+    var got = pre_n;
+    while (got < len) {
+        var iov: [1][]u8 = .{body[got..]};
+        const n = stream.read(io, &iov) catch return null;
+        if (n == 0) return null;
+        got += n;
+    }
+    std.debug.assert(got == len);
+    return body;
+}
+
+/// Serves /__theme/data: the resolved active theme plus every named
+/// starting point (embedded presets, then the library's own themes/,
+/// which shadow same-named presets in the editor's picker the same way
+/// resolution does). The library is re-resolved per request so the
+/// editor always sees the manifest as it is on disk now, not as it was
+/// when serve started.
+fn handleThemeData(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: net.Stream) void {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(a, "{\"active\":") catch return;
+    const active: theme.Theme = blk: {
+        const fresh = library.resolve(a, io, .{ .explicit = root, .start_dir = "/", .config_path = "/nonexistent" }) catch break :blk theme.Theme.neutral;
+        break :blk fresh.theme;
+    };
+    appendThemeObject(&out, a, active) catch return;
+    out.appendSlice(a, ",\"themes\":{") catch return;
+    var first = true;
+    for (theme.preset_names) |name| {
+        const preset = theme.parseThemeFile(a, theme.presetSource(name).?) catch continue;
+        appendThemeEntry(&out, a, name, preset, &first) catch return;
+    }
+    const themes_dir = std.fs.path.join(a, &.{ root, "themes" }) catch return;
+    if (std.Io.Dir.openDirAbsolute(io, themes_dir, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+            const name = entry.name[0 .. entry.name.len - ".json".len];
+            if (!theme.isThemeName(name)) continue;
+            const raw = dir.readFileAlloc(io, entry.name, a, .limited(theme.theme_bytes_max)) catch continue;
+            const parsed = theme.parseThemeFile(a, raw) catch continue; // invalid files just don't list
+            appendThemeEntry(&out, a, name, parsed, &first) catch return;
+        }
+    } else |_| {} // no themes/ directory: presets alone
+    out.appendSlice(a, "}}") catch return;
+    writeBody(stream, io, "200 OK", "application/json", out.items);
+}
+
+/// Appends `"name":<theme object>` with a leading comma after the first
+/// entry. Later entries win in JSON parsing, which is how a library
+/// theme shadows a same-named preset in the editor.
+fn appendThemeEntry(out: *std.ArrayList(u8), a: std.mem.Allocator, name: []const u8, th: theme.Theme, first: *bool) !void {
+    if (!first.*) try out.appendSlice(a, ",");
+    first.* = false;
+    try json.appendString(out, a, name);
+    try out.appendSlice(a, ":");
+    try appendThemeObject(out, a, th);
+}
+
+/// Appends one theme as a JSON object (the standalone theme-file shape).
+fn appendThemeObject(out: *std.ArrayList(u8), a: std.mem.Allocator, th: theme.Theme) !void {
+    const rendered = try theme.renderThemeJson(a, th);
+    try out.appendSlice(a, rendered);
+}
+
+/// Serves POST /__theme/save: validates hard (the whole write surface of
+/// the server is this function) and writes `<library>/themes/<name>.json`.
+fn handleThemeSave(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: net.Stream, body: []const u8) void {
+    const SaveRequest = struct { name: []const u8 = "", theme: std.json.Value = .null };
+    const parsed = std.json.parseFromSlice(SaveRequest, a, body, .{ .ignore_unknown_fields = true }) catch {
+        return writeBody(stream, io, "400 Bad Request", "text/plain", "bad save request: want {\"name\":\"...\",\"theme\":{...}}\n");
+    };
+    if (!theme.isThemeName(parsed.value.name)) {
+        return writeBody(stream, io, "400 Bad Request", "text/plain", "bad theme name: want [a-z0-9-], 1 to 64 chars\n");
+    }
+    if (parsed.value.theme != .object) {
+        return writeBody(stream, io, "400 Bad Request", "text/plain", "theme must be an object\n");
+    }
+    const saved = theme.parseThemeValue(a, parsed.value.theme) catch |e| switch (e) {
+        error.NestedBase => return writeBody(stream, io, "400 Bad Request", "text/plain", "saved themes must not declare base\n"),
+        else => return,
+    };
+    if (!theme.fieldLimitsOk(saved)) {
+        return writeBody(stream, io, "400 Bad Request", "text/plain", "theme field too large\n");
+    }
+    const rendered = theme.renderThemeJson(a, saved) catch return;
+    const themes_dir = std.fs.path.join(a, &.{ root, "themes" }) catch return;
+    std.Io.Dir.cwd().createDirPath(io, themes_dir) catch {
+        return writeBody(stream, io, "500 Internal Server Error", "text/plain", "cannot create themes/\n");
+    };
+    const file_path = std.fmt.allocPrint(a, "{s}/{s}.json", .{ themes_dir, parsed.value.name }) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = rendered }) catch {
+        return writeBody(stream, io, "500 Internal Server Error", "text/plain", "write failed\n");
+    };
+    const rel_path = std.fmt.allocPrint(a, "themes/{s}.json", .{parsed.value.name}) catch return;
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(a, "{\"path\":") catch return;
+    json.appendString(&out, a, rel_path) catch return;
+    out.appendSlice(a, "}") catch return;
+    writeBody(stream, io, "200 OK", "application/json", out.items);
 }
 
 /// Writes a status line, `Content-Type`/`Content-Length`, the two headers
@@ -652,7 +827,15 @@ fn regenerateIndex(io: std.Io, lib: library.Library) void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const page = index.generate(a, io, lib) catch return;
+    // Re-resolve the library so a manifest or themes/ edit (including an
+    // editor save) recolors the index on the next scan tick without a
+    // restart; the startup snapshot is only the fallback.
+    const fresh: library.Library = library.resolve(a, io, .{
+        .explicit = lib.root,
+        .start_dir = "/",
+        .config_path = "/nonexistent",
+    }) catch lib;
+    const page = index.generate(a, io, fresh) catch return;
     const dest = std.fs.path.join(a, &.{ lib.root, "index.html" }) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = page }) catch {};
 }
@@ -790,6 +973,32 @@ test "mapPath routes the vendored bundle and nothing else under __assets" {
     const other = try mapPath(t.allocator, "/__assets/other.js");
     try t.expect(other == .file);
     t.allocator.free(other.file);
+}
+
+test "mapPath theme routes" {
+    try t.expect((try mapPath(t.allocator, "/__theme")) == .theme_editor);
+    try t.expect((try mapPath(t.allocator, "/__theme/data")) == .theme_data);
+    try t.expect((try mapPath(t.allocator, "/__theme/save")) == .theme_save);
+}
+
+test "parseContentLength reads the header case-insensitively" {
+    const headers = "POST /__theme/save HTTP/1.1\r\nHost: x\r\ncontent-length: 42\r\n\r\n";
+    try t.expectEqual(@as(?usize, 42), parseContentLength(headers));
+    try t.expectEqual(@as(?usize, null), parseContentLength("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    try t.expectEqual(@as(?usize, null), parseContentLength("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"));
+}
+
+test "theme editor asset wires data, save, and the CSS variable contract" {
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "/__theme/data") != null);
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "/__theme/save") != null);
+    for ([_][]const u8{ "--paper", "--ink", "--ink-3", "--accent", "--rule", "--display", "--mono" }) |v| {
+        try t.expect(std.mem.indexOf(u8, theme_editor_html, v) != null);
+    }
+    // The preview is the library's own index, same origin.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "<iframe") != null);
+    // Self-contained: no external requests from the editor itself.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "http") == null or
+        std.mem.indexOf(u8, theme_editor_html, "src=\"http") == null);
 }
 
 test "queryParam finds values by name and misses cleanly" {
