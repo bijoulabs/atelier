@@ -351,8 +351,11 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
                 var page = body;
                 // Navigation back to the index, and the page's own time
                 // travel, on every page except the index itself (whose
-                // regenerated file history is noise, not authorship).
-                if (!std.mem.eql(u8, rel, "index.html")) {
+                // regenerated file history is noise, not authorship);
+                // the index instead gets the way into the theme editor.
+                if (std.mem.eql(u8, rel, "index.html")) {
+                    page = injectAtBodyEnd(a, page, theme_chip_snippet) catch page;
+                } else {
                     page = injectAtBodyEnd(a, page, home_snippet) catch page;
                     page = injectAtBodyEnd(a, page, history_snippet) catch page;
                 }
@@ -540,6 +543,18 @@ pub const home_snippet = "<style>@media print{#atelier-home{display:none}}</styl
     "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
     "text-decoration:none;color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px\">" ++
     "&larr; Atelier</a>";
+
+/// The settings chip injected at serve time into the served index only:
+/// the discoverable way into the theme editor, which exists only while
+/// serving (so the link must never be written into index.html itself).
+/// Mirrors the home chip's brand-neutral look, docked top right where
+/// pages keep their history chip; the index has no history, so the
+/// corner is free.
+pub const theme_chip_snippet = "<style>@media print{#atelier-theme{display:none}}</style>" ++
+    "<a id=\"atelier-theme\" href=\"/__theme\" style=\"position:fixed;top:14px;right:14px;z-index:9999;" ++
+    "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
+    "text-decoration:none;color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px\">" ++
+    "Theme</a>";
 
 /// The time-travel widget injected at serve time into every non-index
 /// HTML page, live or snapshot (never written to files, the same contract
@@ -986,6 +1001,12 @@ test "parseContentLength reads the header case-insensitively" {
     try t.expectEqual(@as(?usize, 42), parseContentLength(headers));
     try t.expectEqual(@as(?usize, null), parseContentLength("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
     try t.expectEqual(@as(?usize, null), parseContentLength("POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n"));
+}
+
+test "theme chip links the served index to the editor and hides in print" {
+    try t.expect(std.mem.indexOf(u8, theme_chip_snippet, "href=\"/__theme\"") != null);
+    try t.expect(std.mem.indexOf(u8, theme_chip_snippet, "id=\"atelier-theme\"") != null);
+    try t.expect(std.mem.indexOf(u8, theme_chip_snippet, "@media print") != null);
 }
 
 test "theme editor asset wires data, save, and the CSS variable contract" {
