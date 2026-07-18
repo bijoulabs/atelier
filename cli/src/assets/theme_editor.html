@@ -62,6 +62,8 @@
   <div id="startrow">
     <select id="start"></select>
     <button id="use" title="make this the library's theme" disabled>Use</button>
+    <button id="import" title="load a theme JSON file into the editor">Import</button>
+    <input type="file" id="importfile" accept=".json,application/json" hidden>
   </div>
 
   <span class="leg">Colors</span>
@@ -227,6 +229,31 @@
 
   el('use').addEventListener('click', () => {
     if (el('start').value) adopt(el('start').value);
+  });
+
+  // Import: read a theme JSON file into the fields; saving is what
+  // persists it, so a bad pick costs nothing.
+  el('import').addEventListener('click', () => el('importfile').click());
+  el('importfile').addEventListener('change', async () => {
+    const file = el('importfile').files[0];
+    if (!file) return;
+    status.className = '';
+    try {
+      const theme = JSON.parse(await file.text());
+      if (typeof theme !== 'object' || theme === null || Array.isArray(theme)) {
+        throw new Error('not a theme object');
+      }
+      if ('base' in theme) throw new Error('theme files must not declare base');
+      fill(theme);
+      const suggested = file.name.replace(/\.json$/i, '').toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+      if (suggested && !el('name').value) el('name').value = suggested;
+      status.textContent = 'Imported ' + file.name + '; save to keep it.';
+    } catch (e) {
+      status.className = 'err';
+      status.textContent = 'Could not import ' + file.name + ': ' + e.message;
+    }
+    el('importfile').value = '';
   });
 
   el('save').addEventListener('click', () => {

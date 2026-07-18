@@ -1046,6 +1046,9 @@ test "theme editor asset wires data, save, and the CSS variable contract" {
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "atelier-theme") != null);
     // Adopting a theme is one click, not a manifest edit.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "/__theme/apply") != null);
+    // A theme file from anywhere can be imported into the editor.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "type=\"file\"") != null);
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "id=\"import\"") != null);
     // Self-contained: no external requests from the editor itself.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "http") == null or
         std.mem.indexOf(u8, theme_editor_html, "src=\"http") == null);
