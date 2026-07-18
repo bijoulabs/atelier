@@ -262,7 +262,7 @@ fn lessThanLabel(_: void, a: Item, b: Item) bool {
 }
 
 /// Recursively discovers every `*.html` page under `lib.root`, mirroring
-/// donna's `scripts/build-atelier-index.mjs`: excludes `index.html` at the
+/// the earlier internal Node implementation: excludes `index.html` at the
 /// root and anything under a root-level `templates/` directory. Also
 /// prunes dot-directories (e.g. `.git`) so their subtrees are never
 /// descended into. Returned items are sorted by label, case-insensitively.
@@ -635,8 +635,8 @@ fn renderLedger(alloc: std.mem.Allocator, items: []const Item) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// The built-in page shell, structure ported from donna's
-/// `scripts/build-atelier-index.mjs` with the branding lifted out into
+/// The built-in page shell, structure ported from the earlier internal
+/// Node implementation with the branding lifted out into
 /// `{{...}}` placeholders that `render` fills from the library's manifest
 /// (name, tag, theme). Single braces (all the CSS) pass through
 /// `template.fill` untouched; only well-formed `{{IDENT}}` sequences are

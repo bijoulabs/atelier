@@ -1,125 +1,114 @@
 # atelier
 
-A single-binary toolchain for branded HTML collateral libraries, plus the
-global Claude Code skill that drives it. Content lives elsewhere (see the
-library contract below); this repo is generic software with nothing
-confidential in it.
+A workshop for documents: one binary that scaffolds, lints, serves,
+time-travels, and exports branded HTML pages.
+
+![Halcyon, Works: a placeholder studio wearing the porcelain preset](docs/ledger.png)
+
+Your agents deliver here. The bundled Claude Code skill routes their
+plans, specs, proposals, and mockups into the library as branded pages:
+indexed and searchable the moment they exist, versioned by git, served
+on your own network, themed like they came from your studio. Because
+they did. `./install.sh` links the skill; that is the whole setup.
+
+    scaffold      new pages from your own masters, born on-brand
+    serve         hot reload, search, clean URLs, chips
+    time travel   any page, at any commit, straight out of git
+    diff          any two versions, side by side, highlighted
+    theme         live editor, five presets, themes as portable files
+    check         brand and structure linting, with opinions
+    export        print-perfect PDFs, stamped and share-logged
+
+Content and brand live in a library repo of their own; this repo ships
+the tools and stays plain.
+
+    this repo                      your library
+    ───────────────────            ────────────────────────────────
+    atelier, one binary      ──►   atelier.json         the manifest
+    five neutral themes            brand-guidelines.md  the voice
+    the claude code skill          templates/           the masters
+    nothing confidential           themes/              your themes
+                                   *.html               the work
+
+## Start here
+
+    mkdir studio && cd studio
+    echo '{ "name": "My Studio", "theme": "porcelain" }' > atelier.json
+    atelier serve
+
+That is a working library. The index builds itself, pages hot-reload,
+and the Theme chip in the corner opens a live editor. Everything above
+in the screenshot, including the accent on the wordmark's comma, came
+from that one line of manifest.
+
+## Time travel and diffs
+
+In a git repo, every served page carries a history chip. Pick a commit
+and the page re-renders as of that moment under `/@<sha>/`, assets
+included, straight out of git; nothing is written to disk. Pick two
+versions instead and read the change, split or stacked, highlighted by
+an embedded [@pierre/diffs](https://diffs.com) (Apache-2.0, vendored,
+no external requests).
+
+![Draft one against draft two, split view, straight out of git](docs/diff.png)
+
+## Themes
+
+    "theme": "porcelain"                                   adopt by name
+    "theme": { "base": "porcelain", "accent": "#0b5d3b" }  start there, tweak
+    "theme": { "paper": "#FFFCF8", "ink": "#1b1a17" }      spell it out
+
+Names check the library's `themes/` first, then the built-ins
+(`gallery` `ledger` `noir` `porcelain` `terminal`), so a same-named
+file forks a preset. A theme is one JSON file of CSS values; it
+travels as a file, and the editor at `/__theme` imports, previews,
+saves, and applies without you touching a config.
+
+![The theme editor: paint dabs on the left, the real index following along](docs/theme-editor.png)
+
+Saving and applying are the server's only two write routes, both
+narrow and audited; everything else is GET. New pages scaffold
+on-brand via `{{BRAND_*}}` placeholders. A good new preset is a
+welcome one-file PR.
+
+<details>
+<summary>The full field list</summary>
+
+`paper`, `ink`, `muted`, `accent`, `rule` (CSS colors),
+`display_font`, `mono_font` (font stacks), `font_link` (a stylesheet
+URL, emitted as a `<link>` when set), and `palette`, an array of extra
+colors `check` will accept. Every field defaults to a neutral look
+with no external requests.
+
+</details>
+
+## Checking
+
+`atelier check` errors on missing titles, missing author stamps,
+broken links, and em dashes (write like a person). It warns on colors
+and fonts that wander off brand. Every rule can be switched off in the
+manifest; the defaults have opinions.
+
+Pages may carry `<meta name="atelier:KEY" content="...">` tags; all of
+it is searchable from the index, and `atelier:agent` / `atelier:client`
+become stamps and filter chips on the ledger.
 
 ## Commands
 
-    atelier new <template> <dest> [--set KEY=VALUE ...]   scaffold from a master
-    atelier index                                          regenerate index.html
-    atelier pdf <page> [-o out.pdf]                        render via headless Chromium
-    atelier check [page]                                   lint against the brand and structure
-    atelier share <page> [--for X] [-o out.pdf]            stamped PDF export + share log
-    atelier serve [path] [--port N] [--no-reload]          static server, hot reload, auto-index, time travel
+    atelier new <template> <dest> [--set K=V]   scaffold from a master
+    atelier index                               rebuild index.html
+    atelier check [page]                        lint brand and structure
+    atelier pdf <page> [-o out] [--rev sha]     print via headless Chromium
+    atelier share <page> [--for X]              stamped PDF + share log
+    atelier serve [path] [--port N]             serve, watch, time travel
+    atelier theme list|show <name>              browse themes
 
-## Library contract
+Every command finds the library the same way: `--library`, else the
+nearest ancestor with `atelier.json`, else `~/.config/atelier/config`.
 
-A library is any directory with an `atelier.json`:
+## Install and hack
 
-    { "name": "Acme Co", "tag": "Example · Tagline", "port": 8789 }
+    ./install.sh [library-path]     build to ~/.local/bin, link the skill
+    cd cli && zig build test        the whole suite, colocated with the code
 
-plus `brand-guidelines.md` and `templates/`. Resolution order: explicit path,
-nearest ancestor with `atelier.json`, then `library=` in `~/.config/atelier/config`.
-
-### Theming
-
-The index page's branding comes from the `theme` value in `atelier.json`,
-which takes three forms. A name adopts a theme wholesale:
-
-    "theme": "porcelain"
-
-Names resolve to `<library>/themes/<name>.json` first, then to the
-presets built into the binary (`gallery`, `ledger`, `noir`, `porcelain`,
-`terminal`), so dropping a same-named file into `themes/` forks a preset.
-A base plus overrides is the one-line brand customization:
-
-    "theme": { "base": "porcelain", "accent": "#0b5d3b" }
-
-And a plain object still works as it always has; every field defaults to
-a neutral look with no external requests. Colors are CSS color values,
-fonts are CSS font-family stacks, `font_link` is a stylesheet URL
-(emitted as a `<link>` when set):
-
-    "theme": {
-      "paper": "#FFFCF8", "ink": "#1b1a17",
-      "muted": "#57534a", "accent": "#9a3b32", "rule": "#e2c9b5",
-      "display_font": "'Fraunces',Georgia,serif",
-      "mono_font": "'JetBrains Mono',ui-monospace,monospace",
-      "font_link": "https://fonts.googleapis.com/css2?family=..."
-    }
-
-Theme files in `themes/` are that same object as a standalone JSON file
-(no `base` in files; composition lives in the manifest). `atelier theme
-list` shows every available theme and which is active; `atelier theme
-show <name>` prints one to copy as a starting point.
-
-While `atelier serve` runs, `/__theme` is a live theme editor: pick a
-starting point, adjust colors and fonts while the real index previews
-alongside, and save to `themes/<name>.json`. Saving is the server's one
-non-GET endpoint, narrowly scoped: it validates the name (`[a-z0-9-]`,
-so it cannot write outside `themes/`), caps sizes, and touches nothing
-else. Adopting the saved theme is still a one-line manifest edit, shown
-after each save; with hot reload on, the index recolors on the next scan
-tick without a restart.
-
-The wordmark accents the first comma of `name` with the theme's accent
-color (invisible under the neutral theme, whose accent equals the ink).
-
-An optional `palette` array in the theme lists extra hex colors
-`atelier check` accepts (the brand's extended palette). Theme values also
-feed `atelier new` as `{{BRAND_*}}` placeholders (`BRAND_PAPER`,
-`BRAND_INK`, `BRAND_MUTED`, `BRAND_ACCENT`, `BRAND_RULE`,
-`BRAND_DISPLAY_FONT`, `BRAND_MONO_FONT`, `BRAND_FONT_LINK`), so masters
-scaffold with the current brand.
-
-### Checking
-
-`atelier check [page]` lints one page or the whole library. Errors (exit
-1): missing or blank title, missing `atelier:agent` stamp, em dashes,
-broken internal references (serve's clean-URL rules applied). Warnings:
-hex colors outside the theme palette, font families outside the theme
-stacks. A page declaring `<meta name="atelier:brand" content="custom">`
-is a deliberate sub-brand and skips the style warnings only.
-
-Check rules are opinionated by default and configurable via an optional
-`check` object in `atelier.json`: `{ "check": { "forbid_em_dash": false } }`
-disables the em dash error.
-
-### Time travel
-
-When the library is a git repository, every page served by `atelier serve`
-carries a history chip (top right, hidden in print) listing the commits
-that touched that page. Picking one re-renders the page as of that commit
-under a `/@<sha>/` URL prefix; because the prefix is part of the path,
-every relative asset and link the page requests resolves from the same
-commit, a faithful whole-tree snapshot. Snapshots are read straight from
-git, never written to disk, and skip hot reload; the working tree stays
-the default view. History stops at a page's last rename.
-
-The same panel diffs any two versions of a page: each row carries a
-from/to pick (the working tree included), and the diff view at
-`/__diff/<page>?from=X&to=Y` renders side by side or stacked with syntax
-highlighting, courtesy of a vendored [@pierre/diffs](https://diffs.com)
-build (Apache-2.0) embedded in the binary and served at
-`/__assets/diffs.js`. No external requests; see
-`cli/src/assets/REGENERATE.md` for provenance and the update recipe.
-
-### Page metadata
-
-Pages may declare `<meta name="atelier:KEY" content="VALUE">` tags (double
-quotes, `name` before `content`; keys `[a-z0-9_-]+`). All values are
-searchable from the index. Two keys are first-class: `atelier:agent` (who
-authored the page) and `atelier:client` (who it is for) render as stamps
-on each ledger entry and become filter chips.
-
-## Install
-
-    ./install.sh [library-path]    builds to ~/.local/bin/atelier, links the
-                                   skill into ~/.claude/skills/atelier; the
-                                   optional path seeds ~/.config/atelier/config
-
-## Build / test
-
-    cd cli && zig build && zig build test
+Zig 0.17-dev. `CLAUDE.md` is the map. MIT licensed.

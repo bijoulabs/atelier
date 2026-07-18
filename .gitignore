@@ -3,3 +3,4 @@ cli/zig-out/
 .zig-cache/
 zig-out/
 .superpowers/
+CLAUDE.local.md
