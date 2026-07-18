@@ -1,0 +1,7 @@
+body{margin:0;background:#fbf7f0;color:#221e19;font:16px/1.7 Georgia,'Times New Roman',serif}
+.page{max-width:680px;margin:0 auto;padding:72px 32px}
+h1{font-size:34px;line-height:1.15;letter-spacing:-.01em;margin:0 0 6px}
+.kicker{font:600 10px/1 ui-monospace,monospace;letter-spacing:.22em;text-transform:uppercase;color:#8c3a2e;margin-bottom:18px}
+.rule{border:0;border-top:1px solid #e4d5c0;margin:28px 0}
+p{margin:0 0 16px}
+.meta{font:500 11px/1.6 ui-monospace,monospace;color:#6b6257}
