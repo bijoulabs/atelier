@@ -232,6 +232,35 @@ pub fn resolveSpec(alloc: std.mem.Allocator, io: std.Io, root: []const u8, value
     }
 }
 
+/// Rewrites the library manifest's `theme` field to adopt the named
+/// theme, which must resolve (library file or preset) so the manifest
+/// can never end up pointing at nothing. The manifest is re-serialized
+/// with two-space indentation; every other field, known to atelier or
+/// not, rides through the Value round trip untouched. This is the one
+/// place atelier writes `atelier.json`, added when hand-editing after
+/// every editor save proved to be friction rather than safety.
+pub fn adoptTheme(alloc: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8) !void {
+    const adopted = try resolveNamed(alloc, io, root, name);
+    adopted.deinit(alloc);
+
+    const manifest_path = try std.fs.path.join(alloc, &.{ root, "atelier.json" });
+    defer alloc.free(manifest_path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, alloc, .limited(theme_bytes_max));
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadThemeSpec;
+    try parsed.value.object.put(parsed.arena.allocator(), "theme", .{ .string = name });
+
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    defer aw.deinit();
+    try std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, &aw.writer);
+    try aw.writer.writeAll("\n");
+    const out = try aw.toOwnedSlice();
+    defer alloc.free(out);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = out });
+}
+
 /// Renders an owned `Theme` as pretty-printed standalone theme-file
 /// JSON, the exact shape `parseThemeFile` reads back. Caller owns the
 /// buffer.
@@ -407,6 +436,34 @@ test "parseThemeValue mirrors parseThemeFile including base rejection" {
     const based = try specValue(t.allocator, "{\"base\":\"noir\"}");
     defer based.deinit();
     try t.expectError(error.NestedBase, parseThemeValue(t.allocator, based.value));
+}
+
+test "adoptTheme rewrites the manifest theme field and keeps the rest" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data =
+        \\{"name":"Acme","tag":"T","port":9001,"custom":true,"theme":{"accent":"#111111"}}
+    });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try adoptTheme(t.allocator, t.io, root, "noir");
+    const raw = try tmp.dir.readFileAlloc(t.io, "atelier.json", t.allocator, .limited(64 * 1024));
+    defer t.allocator.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("noir", parsed.value.object.get("theme").?.string);
+    try t.expectEqualStrings("Acme", parsed.value.object.get("name").?.string);
+    try t.expectEqual(@as(i64, 9001), parsed.value.object.get("port").?.integer);
+    try t.expect(parsed.value.object.get("custom").?.bool);
+}
+
+test "adoptTheme refuses names that resolve nowhere" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    try t.expectError(error.UnknownTheme, adoptTheme(t.allocator, t.io, root, "no-such"));
 }
 
 test "renderThemeJson round-trips through parseThemeFile" {

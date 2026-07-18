@@ -18,7 +18,9 @@
   #back{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.14em;
     text-transform:uppercase;text-decoration:none;color:#8d8478;margin-bottom:14px}
   #back:hover{color:#e8e2d8}
-  #start{margin:18px 0 6px}
+  #startrow{display:flex;gap:8px;margin:18px 0 6px}
+  #startrow select{flex:1}
+  button:disabled{opacity:.35;cursor:default}
   label,.leg{display:block;font-size:9px;font-weight:600;letter-spacing:.18em;
     text-transform:uppercase;color:#8d8478;margin:14px 0 4px}
   .hint{color:#5f584e;text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px}
@@ -57,7 +59,10 @@
   <h1><b>Theme editor</b> &middot; changes preview live, nothing is written until you save</h1>
 
   <label for="start">Start from</label>
-  <select id="start"></select>
+  <div id="startrow">
+    <select id="start"></select>
+    <button id="use" title="make this the library's theme" disabled>Use</button>
+  </div>
 
   <span class="leg">Colors</span>
   <div id="colors"></div>
@@ -191,12 +196,37 @@
       opt.textContent = name;
       start.appendChild(opt);
     }
-    start.addEventListener('change', () => fill(start.value ? themes[start.value] : data.active));
+    start.addEventListener('change', () => {
+      fill(start.value ? themes[start.value] : data.active);
+      el('use').disabled = !start.value;
+    });
     fill(data.active || {});
     status.textContent = 'Adjust fields; the index on the right follows along.';
   }).catch(() => {
     status.className = 'err';
     status.textContent = 'Could not load /__theme/data.';
+  });
+
+  // Adopt a named theme: rewrites the manifest's theme line server-side.
+  function adopt(name, after) {
+    fetch('/__theme/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    }).then(async (r) => {
+      const text = await r.text();
+      if (!r.ok) throw new Error(text.trim());
+      status.className = '';
+      status.textContent = 'The library now uses ' + name + '.';
+      if (after) after();
+    }).catch((e) => {
+      status.className = 'err';
+      status.textContent = 'Could not apply: ' + e.message;
+    });
+  }
+
+  el('use').addEventListener('click', () => {
+    if (el('start').value) adopt(el('start').value);
   });
 
   el('save').addEventListener('click', () => {
@@ -216,10 +246,12 @@
       if (!r.ok) throw new Error(text.trim());
       const path = JSON.parse(text).path;
       status.innerHTML = '';
-      status.append('Saved ' + path + '. To adopt it, set ');
-      const code = document.createElement('code');
-      code.textContent = '"theme": "' + name + '"';
-      status.append(code, ' in atelier.json.');
+      const link = document.createElement('a');
+      link.href = '#';
+      link.textContent = 'use it now';
+      link.style.color = '#e8e2d8';
+      link.addEventListener('click', (ev) => { ev.preventDefault(); adopt(name); });
+      status.append('Saved ' + path + '. ', link, ' or keep tweaking.');
     }).catch((e) => {
       status.className = 'err';
       status.textContent = 'Save failed: ' + e.message;

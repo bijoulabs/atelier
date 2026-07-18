@@ -14,6 +14,7 @@ pub const Route = union(enum) {
     theme_editor,
     theme_data,
     theme_save,
+    theme_apply,
     reload,
     bad,
 
@@ -51,6 +52,7 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     if (std.mem.eql(u8, target, "/__theme")) return .theme_editor;
     if (std.mem.eql(u8, target, "/__theme/data")) return .theme_data;
     if (std.mem.eql(u8, target, "/__theme/save")) return .theme_save;
+    if (std.mem.eql(u8, target, "/__theme/apply")) return .theme_apply;
     if (std.mem.indexOfScalar(u8, target, '\\') != null) return .bad;
     if (!std.mem.startsWith(u8, target, "/")) return .bad;
     var it = std.mem.splitScalar(u8, target[1..], '/');
@@ -275,17 +277,19 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
     }
 
     const route = mapPath(a, target) catch return;
-    // POST exists for exactly one route, the theme editor's save; the
-    // server is GET-only everywhere else on purpose (an open tailnet
-    // port must not be able to modify the library beyond themes/).
-    if (is_post != (route == .theme_save)) {
+    // POST exists for exactly two routes, the theme editor's save and
+    // apply; the server is GET-only everywhere else on purpose (an open
+    // tailnet port must not modify the library beyond themes/ and the
+    // manifest's theme line).
+    const wants_post = route == .theme_save or route == .theme_apply;
+    if (is_post != wants_post) {
         return writeBody(stream, io, "405 Method Not Allowed", "text/plain", "wrong method\n");
     }
     switch (route) {
         .bad => return writeBody(stream, io, "400 Bad Request", "text/plain", "bad path\n"),
         .theme_editor => return writeBody(stream, io, "200 OK", "text/html; charset=utf-8", theme_editor_html),
         .theme_data => return handleThemeData(a, io, root, stream),
-        .theme_save => {
+        .theme_save, .theme_apply => {
             const content_length = parseContentLength(head) orelse {
                 return writeBody(stream, io, "411 Length Required", "text/plain", "length required\n");
             };
@@ -293,6 +297,7 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) vo
                 return writeBody(stream, io, "413 Content Too Large", "text/plain", "body too large\n");
             }
             const body = readBody(a, io, stream, buf[header_end..have], content_length) orelse return;
+            if (route == .theme_apply) return handleThemeApply(a, io, root, stream, body);
             return handleThemeSave(a, io, root, stream, body);
         },
         .diffs_bundle => {
@@ -487,6 +492,22 @@ fn handleThemeSave(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: n
     json.appendString(&out, a, rel_path) catch return;
     out.appendSlice(a, "}") catch return;
     writeBody(stream, io, "200 OK", "application/json", out.items);
+}
+
+/// Serves POST /__theme/apply: adopts a named theme by rewriting the
+/// manifest's `theme` field (see `theme.adoptTheme`). The name must
+/// already resolve, so this can never point the manifest at nothing.
+fn handleThemeApply(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: net.Stream, body: []const u8) void {
+    const ApplyRequest = struct { name: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(ApplyRequest, a, body, .{ .ignore_unknown_fields = true }) catch {
+        return writeBody(stream, io, "400 Bad Request", "text/plain", "bad apply request: want {\"name\":\"...\"}\n");
+    };
+    theme.adoptTheme(a, io, root, parsed.value.name) catch |e| switch (e) {
+        error.UnknownTheme => return writeBody(stream, io, "400 Bad Request", "text/plain", "unknown theme name\n"),
+        else => return writeBody(stream, io, "500 Internal Server Error", "text/plain", "could not update atelier.json\n"),
+    };
+    const rel_name = std.fmt.allocPrint(a, "{{\"applied\":\"{s}\"}}", .{parsed.value.name}) catch return;
+    writeBody(stream, io, "200 OK", "application/json", rel_name);
 }
 
 /// Writes a status line, `Content-Type`/`Content-Length`, the two headers
@@ -994,6 +1015,7 @@ test "mapPath theme routes" {
     try t.expect((try mapPath(t.allocator, "/__theme")) == .theme_editor);
     try t.expect((try mapPath(t.allocator, "/__theme/data")) == .theme_data);
     try t.expect((try mapPath(t.allocator, "/__theme/save")) == .theme_save);
+    try t.expect((try mapPath(t.allocator, "/__theme/apply")) == .theme_apply);
 }
 
 test "parseContentLength reads the header case-insensitively" {
@@ -1022,6 +1044,8 @@ test "theme editor asset wires data, save, and the CSS variable contract" {
     // The preview strips the injected theme chip, or clicking it would
     // open the editor inside its own preview.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "atelier-theme") != null);
+    // Adopting a theme is one click, not a manifest edit.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "/__theme/apply") != null);
     // Self-contained: no external requests from the editor itself.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "http") == null or
         std.mem.indexOf(u8, theme_editor_html, "src=\"http") == null);
