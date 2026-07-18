@@ -15,6 +15,9 @@
     border-right:1px solid #2b2620;padding:20px 20px 28px;overflow-y:auto;max-height:100vh}
   h1{font-size:10px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;color:#8d8478}
   h1 b{color:#e8e2d8;font-weight:600}
+  #back{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.14em;
+    text-transform:uppercase;text-decoration:none;color:#8d8478;margin-bottom:14px}
+  #back:hover{color:#e8e2d8}
   #start{margin:18px 0 6px}
   label,.leg{display:block;font-size:9px;font-weight:600;letter-spacing:.18em;
     text-transform:uppercase;color:#8d8478;margin:14px 0 4px}
@@ -50,6 +53,7 @@
 </head>
 <body>
 <div id="rail">
+  <a id="back" href="/">&larr; Atelier</a>
   <h1><b>Theme editor</b> &middot; changes preview live, nothing is written until you save</h1>
 
   <label for="start">Start from</label>
@@ -138,6 +142,10 @@
   function apply() {
     const doc = frame.contentDocument;
     if (!doc) return;
+    // The served index carries the injected theme chip; inside the
+    // preview it would open the editor within the editor, so strip it.
+    const chip = doc.getElementById('atelier-theme');
+    if (chip) chip.remove();
     const root = doc.documentElement;
     const theme = current();
     for (const [id, cssvar] of COLORS) if (theme[id]) root.style.setProperty(cssvar, theme[id]);

@@ -1017,6 +1017,11 @@ test "theme editor asset wires data, save, and the CSS variable contract" {
     }
     // The preview is the library's own index, same origin.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "<iframe") != null);
+    // A way back out of the editor.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "href=\"/\"") != null);
+    // The preview strips the injected theme chip, or clicking it would
+    // open the editor inside its own preview.
+    try t.expect(std.mem.indexOf(u8, theme_editor_html, "atelier-theme") != null);
     // Self-contained: no external requests from the editor itself.
     try t.expect(std.mem.indexOf(u8, theme_editor_html, "http") == null or
         std.mem.indexOf(u8, theme_editor_html, "src=\"http") == null);
