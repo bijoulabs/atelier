@@ -100,10 +100,12 @@ stateless. Teammates point whatever agent they use at it and author
 documents in the library without installing anything; the binary and
 the library stay on the serve machine.
 
-    claude mcp add --transport http atelier http://<host>:<port>/mcp
+    atelier connect
 
-(or your agent's streamable-HTTP MCP equivalent). The tools mirror the
-CLI: `get_brand_guidelines`, `list_documents`, `read_document`,
+prints the exact join command for this machine
+(`claude mcp add --transport http atelier http://<host>:<port>/mcp`, or
+point any streamable-HTTP MCP client at the same URL); the serve banner
+names the endpoint too. The tools mirror the CLI: `get_brand_guidelines`, `list_documents`, `read_document`,
 `check_document`, `list_templates`, `write_document`,
 `new_from_template`, `share_document`, `render_pdf`, `reindex`. The
 server's `initialize` response carries the authoring contract; agents
@@ -140,6 +142,7 @@ would serve there, the same shadowing as `/__theme`. Requests need a
     atelier pdf <page> [-o out] [--rev sha]     print via headless Chromium
     atelier share <page> [--for X]              stamped PDF + share log
     atelier serve [path] [--port N]             serve, watch, time travel
+    atelier connect                             print the MCP join command
     atelier theme list|show <name>              browse themes
 
 Every command finds the library the same way: `--library`, else the

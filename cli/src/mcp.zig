@@ -50,6 +50,19 @@ const instructions_text =
     "write; call reindex only when the owner runs the server without live " ++
     "reload. Never try to start or stop the server; the owner runs it.";
 
+/// The one-liner that connects a Claude Code agent to this endpoint;
+/// `atelier connect` and the serve banner both print it, so how to join
+/// is a command away, not a docs hunt. Other agents use the same URL
+/// with their own streamable-HTTP MCP syntax. Caller owns the result.
+pub fn connectLine(alloc: std.mem.Allocator, host: []const u8, port: u16) ![]u8 {
+    std.debug.assert(host.len > 0);
+    return std.fmt.allocPrint(
+        alloc,
+        "claude mcp add --transport http atelier http://{s}:{d}/mcp",
+        .{ host, port },
+    );
+}
+
 /// What serve.handleMcp should put on the wire; the split keeps HTTP
 /// status decisions here with the framing that mandates them.
 pub const HandleResult = union(enum) {
@@ -871,6 +884,15 @@ const t = std.testing;
 fn call(alloc: std.mem.Allocator, body: []const u8) HandleResult {
     const loopback = net.IpAddress.parseIp4("127.0.0.1", 1) catch unreachable;
     return handle(alloc, t.io, "/", loopback, body);
+}
+
+test "connectLine is the one-liner an agent needs" {
+    const line = try connectLine(t.allocator, "studio-host", 8789);
+    defer t.allocator.free(line);
+    try t.expectEqualStrings(
+        "claude mcp add --transport http atelier http://studio-host:8789/mcp",
+        line,
+    );
 }
 
 test "handle answers garbage with a parse error and null id" {

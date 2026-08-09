@@ -7,6 +7,7 @@ const serve = @import("serve.zig");
 const check = @import("check.zig");
 const share = @import("share.zig");
 const theme = @import("theme.zig");
+const mcp = @import("mcp.zig");
 
 pub const version = "0.1.0";
 
@@ -24,6 +25,7 @@ const usage_text = "atelier " ++ version ++ "\n" ++
     "  atelier check [page] [--library <path>]\n" ++
     "  atelier share <page> [--for <recipient>] [-o out.pdf] [--library <path>]\n" ++
     "  atelier serve [path] [--port N] [--no-reload] [--library <path>]\n" ++
+    "  atelier connect [--port N] [--library <path>]\n" ++
     "  atelier theme list|show <name> [--library <path>]\n";
 
 fn usage(io: std.Io, code: u8) noreturn {
@@ -52,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdShare(arena, io, init.environ_map, args);
     } else if (std.mem.eql(u8, cmd, "serve")) {
         try cmdServe(arena, io, init.environ_map, args);
+    } else if (std.mem.eql(u8, cmd, "connect")) {
+        try cmdConnect(arena, io, init.environ_map, args);
     } else if (std.mem.eql(u8, cmd, "theme")) {
         try cmdTheme(arena, io, init.environ_map, args);
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -383,6 +387,43 @@ fn cmdShare(
 
     std.debug.print("wrote {s}\n", .{out_abs});
     std.debug.print("logged: {s}", .{result.log_line});
+}
+
+/// Implements `atelier connect [--port N] [--library <path>]`.
+///
+/// Prints the one-liner that points an agent at this library's running
+/// server, so joining is a command away instead of a docs hunt. The
+/// host is this machine's hostname: reachable as-is on flat private
+/// networks and on tailnets with MagicDNS; when the published address
+/// differs, the owner substitutes it in the printed line.
+fn cmdConnect(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    args: []const [:0]const u8,
+) !void {
+    const lib = try resolveFromArgs(alloc, io, environ, args, null);
+    var port: u16 = lib.port;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+            port = std.fmt.parseInt(u16, args[i + 1], 10) catch {
+                std.debug.print("bad --port (want 0-65535): {s}\n", .{args[i + 1]});
+                std.process.exit(1);
+            };
+            i += 1;
+        }
+    }
+
+    var host_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = std.posix.gethostname(&host_buffer) catch "<host>";
+    const line = try mcp.connectLine(alloc, host, port);
+    const out = try std.fmt.allocPrint(
+        alloc,
+        "connect an agent to {s}:\n\n  {s}\n\nany streamable http mcp client can use the same url. the server must\nbe running (`atelier serve`, the library owner's job).\n",
+        .{ lib.name, line },
+    );
+    try std.Io.File.stdout().writeStreamingAll(io, out);
 }
 
 /// Implements `atelier serve [path] [--port N] [--no-reload] [--library <path>]`.

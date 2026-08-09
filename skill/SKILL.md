@@ -1,69 +1,50 @@
 ---
 name: atelier
-description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, design mocks, any presentable HTML/PDF page) from ANY repo or project. Use whenever producing a presentable or shareable page: client collateral, internal docs and reports, product/UX mockups, design explorations, or anything that would otherwise be published as a claude.ai Artifact; the atelier library is ALWAYS preferred over the Artifact tool; documents are served over the owner's tailnet, never public URLs. Drives the `atelier` CLI (new/index/check/pdf/share/serve); content lives in the configured atelier library, not the current project.
+description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, design mocks, any presentable HTML/PDF page) from ANY repo or project. Use whenever producing a presentable or shareable page: client collateral, internal docs and reports, product/UX mockups, design explorations, or anything that would otherwise be published as a claude.ai Artifact; the atelier library is ALWAYS preferred over the Artifact tool; documents are served on the owner's private network, never public URLs. Authoring goes through the library server's MCP tools (mcp__atelier__*); the local `atelier` CLI is the owner-only fallback.
 ---
 
 # Atelier: branded document libraries, from anywhere
 
-An atelier library is a directory of presentable HTML documents with an
-`atelier.json` manifest, a `brand-guidelines.md`, and `templates/`. The
-`atelier` CLI indexes, lints, serves, and exports it. This skill runs from any
-project; documents never live in the host project.
+An atelier library is a directory of presentable HTML documents served by
+its owner's `atelier` server. Route every presentable page here, never to
+claude.ai Artifacts. This skill runs from any project; documents never
+live in the host project.
 
 ## Procedure
 
-1. **Resolve the library.** `--library <path>` on every command; otherwise the
-   nearest ancestor with `atelier.json`, then `library=` in
-   `~/.config/atelier/config`. A task can name a different library.
-2. **Read `brand-guidelines.md` in the library root before authoring anything.**
-   It is the canon for palette, type, components, layout, writing style, and
-   the library's own operational policy (how documents may be shared, who runs
-   the server). Its rules win over your defaults.
-3. **Author in the library working tree.** HTML only for presentable documents;
-   print collateral keeps a one-page discipline unless the guidelines say
-   otherwise. Start from a master: `atelier new <template> <dest> --set
-   KEY=VALUE ...` fills mechanical placeholders (including `{{BRAND_*}}` tokens
-   from the manifest theme) and reports what remains; write the judgment
-   content yourself, in the library's voice. Stamp every page you create with
-   `<meta name="atelier:agent" content="<your agent name>">` and, when the work
-   is for someone, `<meta name="atelier:client" content="<client>">` (double
-   quotes, `name` before `content`): the index's provenance stamps and filter
-   chips come from these. A page deliberately carrying another identity (a
-   client's own brand) declares `<meta name="atelier:brand" content="custom">`
-   to opt out of style warnings only.
-4. **Check before committing.** Run `atelier check <page>` and fix every error
-   (missing title or agent stamp, broken internal links, forbidden characters);
-   treat palette and font warnings as brand-drift signals. `atelier index`
-   refreshes the ledger; it is unnecessary while the library's server is
-   running, which reindexes on change.
-5. **Export deliberately.** For anything sent outside, prefer
-   `atelier share <page> --for <client>` over bare `atelier pdf`: it stamps the
-   artifact with provenance and records the send in `shares.log`.
-   `atelier pdf <page> --rev <sha>` reproduces exactly what was sent before.
-6. **Commit in the library repo** using that repository's configured git
-   identity, no co-author trailers, message describing the document.
-7. **Confidentiality.** Source material, data-room exports, and research inputs
-   stay in the HOST project's gitignored scratch. Only the presentable artifact
-   enters the library.
-8. **Never start or stop servers.** The library's owner runs `atelier serve`;
-   preview via the served URL or curl. If the server looks down, say so; do not
-   start it.
+1. **Author through the MCP tools.** If `mcp__atelier__*` tools are in
+   your session, they are the authoring path. The server's initialize
+   instructions carry the full contract; in brief: `get_brand_guidelines`
+   first and its rules win over your defaults, stamp every page with
+   `<meta name="atelier:agent" content="<your agent name>">` (plus
+   `atelier:client` when the work is for someone, and
+   `atelier:brand=custom` only when a page deliberately carries another
+   identity), run `check_document` and fix every error before calling
+   work done, pass `commit_message` on writes (why, one line, no
+   trailers), and export outbound documents with `share_document`, never
+   bare `render_pdf`. Attribution is automatic.
+2. **Not connected?** Ask the user to run the join command; on the
+   serve machine, `atelier connect` prints it
+   (`claude mcp add --transport http atelier http://<host>:<port>/mcp`).
+   Do not fall back to publishing an Artifact, and do not go hunting
+   for a local binary on a machine that is not the server's.
+3. **Confidentiality.** Source material, data-room exports, and research
+   inputs stay in the HOST project's gitignored scratch. Only the
+   presentable artifact enters the library.
+4. **Never start or stop servers.** The library's owner runs
+   `atelier serve`; preview via the served URL or curl. If the server
+   looks down, say so; do not start it.
 
-## Remote libraries
+## Owner-only CLI fallback
 
-When the library lives on another machine, connect to its running
-server's MCP endpoint instead of using the local CLI:
-`claude mcp add --transport http atelier http://<host>:<port>/mcp` (or
-your agent's streamable-HTTP equivalent). The tools mirror this
-procedure and the same contract applies: `get_brand_guidelines` first,
-stamp the `atelier:agent` meta, `check_document` until clean,
-`share_document` for anything outbound, and pass `commit_message` on
-writes so the library's history stays authored. Your identity on the
-network is recorded automatically; `shares.log` entries made through
-the server carry a column naming the submitter. Rule 8 stands
-unchanged: never start or stop servers.
-
-## CLI quick reference
+On the machine that hosts the library itself, the `atelier` CLI covers
+what MCP deliberately does not: running the server, placing binary
+assets (images, fonts) into the library, and authoring while the server
+is down. The same contract applies, with two additions the server
+otherwise handles for you: read `brand-guidelines.md` in the library
+root before authoring, and commit in the library repo yourself using
+that repository's configured git identity, no co-author trailers,
+message describing the document.
 
     atelier new <template> <dest> [--set KEY=VALUE ...]
     atelier index
@@ -72,5 +53,5 @@ unchanged: never start or stop servers.
     atelier share <page> [--for <recipient>] [-o out.pdf]
     atelier serve [path] [--port N] [--no-reload]   (the library owner runs this)
 
-All commands accept `--library <path>`. Resolution: explicit > nearest ancestor
-`atelier.json` > `~/.config/atelier/config`.
+All commands accept `--library <path>`. Resolution: explicit > nearest
+ancestor `atelier.json` > `~/.config/atelier/config`.

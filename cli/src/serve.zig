@@ -205,6 +205,11 @@ pub fn run(io: std.Io, lib: library.Library, port: u16, reload: bool) !void {
     const addr = try net.IpAddress.parseIp4("0.0.0.0", port);
     var server = try addr.listen(io, .{ .reuse_address = true });
     std.debug.print("atelier serving {s} on http://0.0.0.0:{d}\n", .{ lib.root, port });
+    // The join command lives one `atelier connect` away; the banner
+    // names the endpoint so the owner never hunts docs for it.
+    var host_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const host = std.posix.gethostname(&host_buffer) catch "<host>";
+    std.debug.print("remote authoring (mcp) at http://{s}:{d}/mcp; `atelier connect` prints the join command\n", .{ host, port });
 
     if (reload) {
         if (std.Thread.spawn(.{}, scanLoop, .{ io, lib })) |scan_th| {
