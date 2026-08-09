@@ -287,7 +287,11 @@ pub fn collectItems(alloc: std.mem.Allocator, io: std.Io, lib: library.Library) 
             // Pruning dot-directories keeps .git and tool state out of the walk, a deliberate deviation from the ported mjs.
             const is_dot = entry.basename.len > 0 and entry.basename[0] == '.';
             const is_root_templates = entry.depth() == 1 and std.mem.eql(u8, entry.basename, "templates");
-            if (!is_dot and !is_root_templates) try walker.enter(io, entry);
+            // Root-level shares/ holds outbound renders (share_document,
+            // render_pdf); what left the building is shares.log's story,
+            // not the ledger's.
+            const is_root_shares = entry.depth() == 1 and std.mem.eql(u8, entry.basename, "shares");
+            if (!is_dot and !is_root_templates and !is_root_shares) try walker.enter(io, entry);
             continue;
         }
         if (entry.kind != .file) continue;
@@ -1191,6 +1195,23 @@ test "collectItems indexes standalone pdfs and skips page renders" {
         }
     }
     try t.expect(found_deck);
+}
+
+test "collectItems keeps root-level shares/ off the ledger, nested shares/ on it" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.createDirPath(t.io, "shares");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "shares/memo-Globex.pdf", .data = "%PDF-outbound" });
+    try tmp.dir.createDirPath(t.io, "notes/shares");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "notes/shares/inner.html", .data = "<title>Inner</title>" });
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const lib = library.Library{ .root = root, .name = "Acme", .tag = "", .port = 8789 };
+    const items = try collectItems(t.allocator, t.io, lib);
+    defer freeItems(t.allocator, items);
+    try t.expectEqual(@as(usize, 1), items.len);
+    try t.expectEqualStrings("Inner", items[0].label);
 }
 
 test "renderLedger marks pdf entries" {
