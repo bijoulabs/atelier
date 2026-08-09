@@ -10,6 +10,10 @@ const std = @import("std");
 const net = std.Io.net;
 const identity = @import("identity.zig");
 const json = @import("json.zig");
+const library = @import("library.zig");
+const index = @import("index.zig");
+const check = @import("check.zig");
+const template = @import("template.zig");
 
 /// Protocol revisions this endpoint knows how to speak. `initialize`
 /// echoes a requested version from this set and otherwise answers with
@@ -54,17 +58,63 @@ pub const HandleResult = union(enum) {
     parse_error: []u8,
 };
 
+/// Upper bound on one document read or written over this endpoint,
+/// matching the CLI's page-read cap and serve's /mcp body cap.
+pub const document_bytes_max = 4 * 1024 * 1024;
+
+/// What one tool invocation produced: text for the agent, and whether it
+/// is reporting a failure (MCP's isError, distinct from protocol errors).
+const ToolResult = struct {
+    text: []const u8,
+    is_error: bool = false,
+};
+
 /// One tool the endpoint offers. `input_schema` is a complete JSON
 /// Schema literal; the table is comptime so tools/list is a constant.
 const ToolDef = struct {
     name: []const u8,
     description: []const u8,
     input_schema: []const u8,
+    handler: *const fn (ctx: *const ToolContext) anyerror!ToolResult,
 };
 
-/// The tool registry; each authoring commit extends it together with the
-/// dispatch arm in `callTool`.
-const tool_defs = [_]ToolDef{};
+/// The tool registry; each authoring commit extends it together with a
+/// handler below.
+const tool_defs = [_]ToolDef{
+    .{
+        .name = "get_brand_guidelines",
+        .description = "The library's brand guidelines; read and follow them before authoring anything.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = toolGetBrandGuidelines,
+    },
+    .{
+        .name = "list_documents",
+        .description = "Every document in the library: path, title, section, served url, kind, mtime, revision count, and atelier meta.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = toolListDocuments,
+    },
+    .{
+        .name = "read_document",
+        .description = "A document's source. Text files only; PDFs and images say where to fetch them instead.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"," ++
+            "\"description\":\"library-relative, e.g. advisory/one; .html is appended when the last segment has no extension\"}}," ++
+            "\"required\":[\"path\"]}",
+        .handler = toolReadDocument,
+    },
+    .{
+        .name = "check_document",
+        .description = "Lint one page (or the whole library when path is omitted): title, agent stamp, broken internal refs, brand drift. Fix every error before calling work done.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"," ++
+            "\"description\":\"one page to check; omit to check every page\"}}}",
+        .handler = toolCheckDocument,
+    },
+    .{
+        .name = "list_templates",
+        .description = "The library's templates and each one's placeholders, for new_from_template.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = toolListTemplates,
+    },
+};
 
 /// The constant tools/list result, assembled at comptime from the table.
 const tools_list_json = blk: {
@@ -149,9 +199,6 @@ fn callTool(
     id: std.json.Value,
     request: std.json.ObjectMap,
 ) HandleResult {
-    _ = io;
-    _ = root;
-    _ = peer;
     const params_value = request.get("params") orelse {
         return asJson(errorBody(alloc, id, -32602, "params.name is required"));
     };
@@ -160,7 +207,252 @@ fn callTool(
         return asJson(errorBody(alloc, id, -32602, "params.name is required"));
     };
     if (name_value != .string) return asJson(errorBody(alloc, id, -32602, "params.name is required"));
+
+    const empty_arguments: std.json.ObjectMap = .empty;
+    const arguments = blk: {
+        const v = params_value.object.get("arguments") orelse break :blk empty_arguments;
+        if (v != .object) break :blk empty_arguments;
+        break :blk v.object;
+    };
+
+    inline for (tool_defs) |def| {
+        if (std.mem.eql(u8, name_value.string, def.name)) {
+            const ctx: ToolContext = .{
+                .alloc = alloc,
+                .io = io,
+                .root = root,
+                .peer = peer,
+                .arguments = arguments,
+            };
+            const outcome = def.handler(&ctx) catch {
+                return asJson(errorBody(alloc, id, -32603, "internal error"));
+            };
+            const envelope = toolEnvelope(alloc, outcome) catch return .accepted;
+            return asJson(resultBody(alloc, id, envelope));
+        }
+    }
     return asJson(errorBody(alloc, id, -32602, "unknown tool"));
+}
+
+/// Wraps a tool outcome in MCP's content envelope.
+fn toolEnvelope(alloc: std.mem.Allocator, outcome: ToolResult) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"content\":[{\"type\":\"text\",\"text\":");
+    try json.appendString(&out, alloc, outcome.text);
+    try out.appendSlice(alloc, if (outcome.is_error) "}],\"isError\":true}" else "}],\"isError\":false}");
+    return out.toOwnedSlice(alloc);
+}
+
+/// Formats a one-line lowercase tool failure, the same voice as the
+/// CLI's own error messages.
+fn toolError(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !ToolResult {
+    return .{ .text = try std.fmt.allocPrint(alloc, fmt, args), .is_error = true };
+}
+
+/// A string argument by name, or null when absent or not a string.
+fn argString(arguments: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const value = arguments.get(name) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+/// A library-relative path acceptable to this endpoint: bounded, no
+/// absolute or traversal forms, no dot segments (dot names are tool
+/// state and .git lives behind one), no control bytes, no backslashes.
+/// The shape itself confines the path, the same philosophy as
+/// theme.isThemeName; nothing here touches the filesystem.
+pub fn isSafeRelPath(rel: []const u8) bool {
+    if (rel.len == 0 or rel.len > 512) return false;
+    for (rel) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+        if (c == '\\') return false;
+    }
+    if (rel[0] == '/') return false;
+    var segments = std.mem.splitScalar(u8, rel, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0) return false;
+        if (segment[0] == '.') return false;
+    }
+    return true;
+}
+
+/// serve's clean-URL rule for tool arguments: a last segment with no
+/// extension names an .html page.
+fn cleanRel(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const last = std.fs.path.basename(raw);
+    if (std.mem.indexOfScalar(u8, last, '.') != null) return alloc.dupe(u8, raw);
+    return std.fmt.allocPrint(alloc, "{s}.html", .{raw});
+}
+
+/// Extensions read_document will inline; everything else is served
+/// bytes, not JSON-string material.
+fn isTextExtension(rel: []const u8) bool {
+    const text_extensions = [_][]const u8{ ".html", ".md", ".css", ".js", ".json", ".svg", ".txt" };
+    const ext = std.fs.path.extension(rel);
+    for (text_extensions) |known| {
+        if (std.mem.eql(u8, ext, known)) return true;
+    }
+    return false;
+}
+
+/// Re-resolves the library from disk, the same per-request pattern as
+/// serve's theme data and index regeneration: manifest and theme edits
+/// take effect without a restart.
+fn resolveLib(ctx: *const ToolContext) !library.Library {
+    return library.resolve(ctx.alloc, ctx.io, .{
+        .explicit = ctx.root,
+        .start_dir = "/",
+        .config_path = "/nonexistent",
+    });
+}
+
+fn toolGetBrandGuidelines(ctx: *const ToolContext) anyerror!ToolResult {
+    const abs = try std.fs.path.join(ctx.alloc, &.{ ctx.root, "brand-guidelines.md" });
+    const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, abs, ctx.alloc, .limited(document_bytes_max)) catch {
+        return toolError(ctx.alloc, "no brand-guidelines.md in this library; author in a restrained, neutral style", .{});
+    };
+    return .{ .text = content };
+}
+
+fn toolReadDocument(ctx: *const ToolContext) anyerror!ToolResult {
+    const raw = argString(ctx.arguments, "path") orelse return toolError(ctx.alloc, "path is required", .{});
+    const rel = try cleanRel(ctx.alloc, raw);
+    if (!isSafeRelPath(rel)) return toolError(ctx.alloc, "bad path: {s}", .{raw});
+    if (!isTextExtension(rel)) {
+        return toolError(ctx.alloc, "binary file; fetch /{s} from this server over http instead", .{rel});
+    }
+    const abs = try std.fs.path.join(ctx.alloc, &.{ ctx.root, rel });
+    const content = std.Io.Dir.cwd().readFileAlloc(ctx.io, abs, ctx.alloc, .limited(document_bytes_max)) catch {
+        return toolError(ctx.alloc, "no document at {s}", .{rel});
+    };
+    return .{ .text = content };
+}
+
+fn toolListDocuments(ctx: *const ToolContext) anyerror!ToolResult {
+    const lib = try resolveLib(ctx);
+    const items = try index.collectItems(ctx.alloc, ctx.io, lib);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.alloc);
+    try out.append(ctx.alloc, '[');
+    for (items, 0..) |item, i| {
+        if (i > 0) try out.append(ctx.alloc, ',');
+        std.debug.assert(item.path.len > 1);
+        std.debug.assert(item.path[0] == '/');
+        const rel = item.path[1..];
+        try out.appendSlice(ctx.alloc, "{\"path\":");
+        try json.appendString(&out, ctx.alloc, rel);
+        try out.appendSlice(ctx.alloc, ",\"title\":");
+        try json.appendString(&out, ctx.alloc, item.label);
+        try out.appendSlice(ctx.alloc, ",\"section\":");
+        try json.appendString(&out, ctx.alloc, item.section);
+        try out.appendSlice(ctx.alloc, ",\"kind\":");
+        try json.appendString(&out, ctx.alloc, item.kind);
+        try out.appendSlice(ctx.alloc, ",\"url\":");
+        const url = if (std.mem.endsWith(u8, item.path, ".html"))
+            item.path[0 .. item.path.len - ".html".len]
+        else
+            item.path;
+        try json.appendString(&out, ctx.alloc, url);
+        const numbers = try std.fmt.allocPrint(ctx.alloc, ",\"mtime\":{d},\"revs\":{d},\"meta\":{{", .{
+            item.mtime_sec,
+            item.revs,
+        });
+        try out.appendSlice(ctx.alloc, numbers);
+        for (item.meta, 0..) |meta, j| {
+            if (j > 0) try out.append(ctx.alloc, ',');
+            try json.appendString(&out, ctx.alloc, meta.key);
+            try out.append(ctx.alloc, ':');
+            try json.appendString(&out, ctx.alloc, meta.value);
+        }
+        try out.appendSlice(ctx.alloc, "}}");
+    }
+    try out.append(ctx.alloc, ']');
+    return .{ .text = try out.toOwnedSlice(ctx.alloc) };
+}
+
+fn toolCheckDocument(ctx: *const ToolContext) anyerror!ToolResult {
+    const lib = try resolveLib(ctx);
+    var rels: std.ArrayList([]const u8) = .empty;
+    if (argString(ctx.arguments, "path")) |raw| {
+        const rel = try cleanRel(ctx.alloc, raw);
+        if (!isSafeRelPath(rel)) return toolError(ctx.alloc, "bad path: {s}", .{raw});
+        try rels.append(ctx.alloc, rel);
+    } else {
+        const items = try index.collectItems(ctx.alloc, ctx.io, lib);
+        for (items) |item| {
+            if (!std.mem.eql(u8, item.kind, "page")) continue;
+            try rels.append(ctx.alloc, item.path[1..]);
+        }
+    }
+
+    var findings_json: std.ArrayList(u8) = .empty;
+    var errors: usize = 0;
+    var warnings: usize = 0;
+    for (rels.items) |rel| {
+        const abs = try std.fs.path.join(ctx.alloc, &.{ lib.root, rel });
+        const html = std.Io.Dir.cwd().readFileAlloc(ctx.io, abs, ctx.alloc, .limited(document_bytes_max)) catch {
+            return toolError(ctx.alloc, "no page at {s}", .{rel});
+        };
+        const findings = try check.checkPage(ctx.alloc, ctx.io, lib, rel, html);
+        for (findings) |finding| {
+            if (findings_json.items.len > 0) try findings_json.append(ctx.alloc, ',');
+            switch (finding.severity) {
+                .err => errors += 1,
+                .warn => warnings += 1,
+            }
+            try findings_json.appendSlice(ctx.alloc, "{\"path\":");
+            try json.appendString(&findings_json, ctx.alloc, rel);
+            try findings_json.appendSlice(ctx.alloc, ",\"severity\":");
+            try findings_json.appendSlice(ctx.alloc, switch (finding.severity) {
+                .err => "\"error\"",
+                .warn => "\"warning\"",
+            });
+            try findings_json.appendSlice(ctx.alloc, ",\"message\":");
+            try json.appendString(&findings_json, ctx.alloc, finding.message);
+            try findings_json.append(ctx.alloc, '}');
+        }
+    }
+    const text = try std.fmt.allocPrint(ctx.alloc, "{{\"pages\":{d},\"errors\":{d},\"warnings\":{d},\"findings\":[{s}]}}", .{
+        rels.items.len,
+        errors,
+        warnings,
+        findings_json.items,
+    });
+    return .{ .text = text };
+}
+
+fn toolListTemplates(ctx: *const ToolContext) anyerror!ToolResult {
+    const templates_abs = try std.fs.path.join(ctx.alloc, &.{ ctx.root, "templates" });
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.alloc);
+    try out.append(ctx.alloc, '[');
+    if (std.Io.Dir.openDirAbsolute(ctx.io, templates_abs, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(ctx.io);
+        var empty_vars = std.StringHashMap([]const u8).init(ctx.alloc);
+        defer empty_vars.deinit();
+        var listed: usize = 0;
+        var entries = dir.iterate();
+        while (entries.next(ctx.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".html")) continue;
+            const source = dir.readFileAlloc(ctx.io, entry.name, ctx.alloc, .limited(document_bytes_max)) catch continue;
+            const filled = try template.fill(ctx.alloc, source, &empty_vars);
+            if (listed > 0) try out.append(ctx.alloc, ',');
+            listed += 1;
+            try out.appendSlice(ctx.alloc, "{\"name\":");
+            try json.appendString(&out, ctx.alloc, entry.name[0 .. entry.name.len - ".html".len]);
+            try out.appendSlice(ctx.alloc, ",\"placeholders\":[");
+            for (filled.unfilled, 0..) |placeholder, i| {
+                if (i > 0) try out.append(ctx.alloc, ',');
+                try json.appendString(&out, ctx.alloc, placeholder);
+            }
+            try out.appendSlice(ctx.alloc, "]}");
+        }
+    } else |_| {} // no templates directory is an empty list, not a failure
+    try out.append(ctx.alloc, ']');
+    return .{ .text = try out.toOwnedSlice(ctx.alloc) };
 }
 
 /// The initialize result: negotiated protocol version, tools-only
@@ -348,4 +640,164 @@ test "tools/call on an unknown tool is invalid params, not a crash" {
     const result = call(arena.allocator(), "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\"," ++
         "\"params\":{\"name\":\"no_such_tool\",\"arguments\":{}}}");
     try t.expect(std.mem.indexOf(u8, result.json, "-32602") != null);
+}
+
+/// Like `call` but against a real library root.
+fn callAt(alloc: std.mem.Allocator, root: []const u8, body: []const u8) HandleResult {
+    const loopback = net.IpAddress.parseIp4("127.0.0.1", 1) catch unreachable;
+    return handle(alloc, t.io, root, loopback, body);
+}
+
+const ToolOutcome = struct { text: []const u8, is_error: bool };
+
+/// Unwraps a tools/call response down to its text content and isError.
+fn toolOutcome(alloc: std.mem.Allocator, result: HandleResult) !ToolOutcome {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.json, .{});
+    const r = parsed.value.object.get("result").?.object;
+    return .{
+        .text = r.get("content").?.array.items[0].object.get("text").?.string,
+        .is_error = r.get("isError").?.bool,
+    };
+}
+
+test "isSafeRelPath admits page paths and rejects the negative space" {
+    const good = [_][]const u8{
+        "memo.html",           "advisory/one.html", "a/b/c.css", "notes.md",
+        "templates/memo.html", "logo.svg",
+    };
+    for (good) |p| try t.expect(isSafeRelPath(p));
+    const bad = [_][]const u8{
+        "",            "/abs.html", "..",           "../x.html",
+        "a/../b.html", "a\\b.html", ".hidden.html", "a/.hidden.html",
+        ".git/config", "a//b.html", "a/./b.html",   "x\x00y.html",
+    };
+    for (bad) |p| try t.expect(!isSafeRelPath(p));
+    // Length fence: 512 bytes is the cap.
+    const long: [513]u8 = @splat('a');
+    try t.expect(!isSafeRelPath(&long));
+}
+
+test "get_brand_guidelines returns the canon or a clear absence" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+
+    const absent = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"get_brand_guidelines\"}}"));
+    try t.expect(absent.is_error);
+
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "brand-guidelines.md", .data = "# brand\nBe restrained." });
+    const found = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"get_brand_guidelines\"}}"));
+    try t.expect(!found.is_error);
+    try t.expectEqualStrings("# brand\nBe restrained.", found.text);
+}
+
+test "read_document round-trips pages and fences the rest" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.createDirPath(t.io, "advisory");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "advisory/one.html", .data = "<title>One</title>" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "deck.pdf", .data = "%PDF" });
+
+    // Clean-URL rule: an extensionless path reads the .html page.
+    const page = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"read_document\",\"arguments\":{\"path\":\"advisory/one\"}}}"));
+    try t.expect(!page.is_error);
+    try t.expectEqualStrings("<title>One</title>", page.text);
+
+    const binary = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"read_document\",\"arguments\":{\"path\":\"deck.pdf\"}}}"));
+    try t.expect(binary.is_error);
+    try t.expect(std.mem.indexOf(u8, binary.text, "/deck.pdf") != null);
+
+    const traversal = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"read_document\",\"arguments\":{\"path\":\"../escape\"}}}"));
+    try t.expect(traversal.is_error);
+
+    const missing = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"read_document\",\"arguments\":{\"path\":\"ghost\"}}}"));
+    try t.expect(missing.is_error);
+}
+
+test "list_documents reports paths, titles, and served urls" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.createDirPath(t.io, "advisory");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "advisory/one.html", .data = "<title>One Pager</title>" });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"list_documents\"}}"));
+    try t.expect(!outcome.is_error);
+    const docs = try std.json.parseFromSlice(std.json.Value, a, outcome.text, .{});
+    const first = docs.value.array.items[0].object;
+    try t.expectEqualStrings("advisory/one.html", first.get("path").?.string);
+    try t.expectEqualStrings("One Pager", first.get("title").?.string);
+    try t.expectEqualStrings("/advisory/one", first.get("url").?.string);
+    try t.expectEqualStrings("advisory", first.get("section").?.string);
+    try t.expectEqualStrings("page", first.get("kind").?.string);
+}
+
+test "check_document reports structured findings without failing the call" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "bare.html", .data = "<html><body>hi</body></html>" });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"check_document\",\"arguments\":{\"path\":\"bare\"}}}"));
+    try t.expect(!outcome.is_error);
+    const report = try std.json.parseFromSlice(std.json.Value, a, outcome.text, .{});
+    const summary = report.value.object;
+    try t.expectEqual(@as(i64, 1), summary.get("pages").?.integer);
+    try t.expect(summary.get("errors").?.integer > 0);
+    const findings = summary.get("findings").?.array;
+    try t.expect(findings.items.len > 0);
+    try t.expectEqualStrings("bare.html", findings.items[0].object.get("path").?.string);
+    // The whole-library mode sees the same page.
+    const all = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"check_document\"}}"));
+    const all_report = try std.json.parseFromSlice(std.json.Value, a, all.text, .{});
+    try t.expectEqual(@as(i64, 1), all_report.value.object.get("pages").?.integer);
+}
+
+test "list_templates names each master and its placeholders" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.createDirPath(t.io, "templates");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "templates/memo.html", .data = "{{BRAND_ACCENT}} {{CLIENT}}" });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"list_templates\"}}"));
+    try t.expect(!outcome.is_error);
+    const templates = try std.json.parseFromSlice(std.json.Value, a, outcome.text, .{});
+    const first = templates.value.array.items[0].object;
+    try t.expectEqualStrings("memo", first.get("name").?.string);
+    const placeholders = first.get("placeholders").?.array;
+    try t.expectEqual(@as(usize, 2), placeholders.items.len);
+    try t.expectEqualStrings("BRAND_ACCENT", placeholders.items[0].string);
+    try t.expectEqualStrings("CLIENT", placeholders.items[1].string);
 }
