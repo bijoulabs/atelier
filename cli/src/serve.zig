@@ -479,6 +479,10 @@ fn handleThemeSave(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: n
     }
     const rendered = theme.renderThemeJson(a, saved) catch return;
     const themes_dir = std.fs.path.join(a, &.{ root, "themes" }) catch return;
+    // All library mutations serialize on write_mu; a theme save must not
+    // interleave with an MCP write's git staging or an index regeneration.
+    library.write_mu.lock(io) catch return;
+    defer library.write_mu.unlock(io);
     std.Io.Dir.cwd().createDirPath(io, themes_dir) catch {
         return writeBody(stream, io, "500 Internal Server Error", "text/plain", "cannot create themes/\n");
     };
@@ -502,6 +506,8 @@ fn handleThemeApply(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: 
     const parsed = std.json.parseFromSlice(ApplyRequest, a, body, .{ .ignore_unknown_fields = true }) catch {
         return writeBody(stream, io, "400 Bad Request", "text/plain", "bad apply request: want {\"name\":\"...\"}\n");
     };
+    library.write_mu.lock(io) catch return;
+    defer library.write_mu.unlock(io);
     theme.adoptTheme(a, io, root, parsed.value.name) catch |e| switch (e) {
         error.UnknownTheme => return writeBody(stream, io, "400 Bad Request", "text/plain", "unknown theme name\n"),
         else => return writeBody(stream, io, "500 Internal Server Error", "text/plain", "could not update atelier.json\n"),
@@ -871,9 +877,14 @@ fn regenerateIndex(io: std.Io, lib: library.Library) void {
         .start_dir = "/",
         .config_path = "/nonexistent",
     }) catch lib;
+    // Serialized and atomic: the scanner and the MCP reindex tool can
+    // both regenerate, and a GET of index.html mid-write must see the
+    // old ledger or the new one, never a truncated file.
+    library.write_mu.lock(io) catch return;
+    defer library.write_mu.unlock(io);
     const page = index.generate(a, io, fresh) catch return;
     const dest = std.fs.path.join(a, &.{ lib.root, "index.html" }) catch return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = page }) catch {};
+    library.writeFileAtomic(io, a, dest, page) catch {};
 }
 
 /// Polls `treeSignature` every 500ms; on change, regenerates the index

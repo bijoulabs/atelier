@@ -99,6 +99,38 @@ fn loadAt(alloc: std.mem.Allocator, io: std.Io, dir_abs: []const u8) !?Library {
     };
 }
 
+/// Serializes every library mutation the serving process performs:
+/// document writes, index regeneration, shares.log appends, theme saves
+/// and applies, and git commits. One coarse process-wide mutex on
+/// purpose: mutations are rare and human-paced, and correctness beats
+/// letting parallel writers loose on one working tree and git repo. It
+/// lives here rather than in serve.zig so serve and the MCP handlers can
+/// both take it without an import cycle. In-process only: a CLI run on
+/// the serve machine is not serialized against the server, same as today.
+///
+/// NOTE: this std has no std.Thread.Mutex; std.Io.Mutex (whose lock and
+/// unlock take io) is the blocking mutex, the same reconciliation as
+/// serve.zig's SSE client list.
+pub var write_mu: std.Io.Mutex = .init;
+
+/// Writes `data` to the absolute path `dest_abs` atomically: bytes land
+/// in a same-directory dot-file first, then one rename replaces the
+/// destination, so a concurrent reader sees the old content or the new,
+/// never a torn write. Same-directory keeps the rename on one
+/// filesystem; the dot prefix keeps a crash leftover out of the ledger
+/// walk and the scanner's tree signature, both of which skip dot names.
+pub fn writeFileAtomic(io: std.Io, alloc: std.mem.Allocator, dest_abs: []const u8, data: []const u8) !void {
+    std.debug.assert(std.fs.path.isAbsolute(dest_abs));
+    const dir = std.fs.path.dirname(dest_abs) orelse return error.BadPathName;
+    const base = std.fs.path.basename(dest_abs);
+    std.debug.assert(base.len > 0);
+    std.debug.assert(base[0] != '.');
+    const temp_abs = try std.fmt.allocPrint(alloc, "{s}/.{s}.tmp", .{ dir, base });
+    defer alloc.free(temp_abs);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_abs, .data = data });
+    try std.Io.Dir.renameAbsolute(temp_abs, dest_abs, io);
+}
+
 /// Selects which library `resolve` should load; a struct because
 /// `start_dir` and `config_path` are both paths and a positional call
 /// could swap them silently.
@@ -306,4 +338,26 @@ test "config fallback" {
 
 test "nothing resolvable is NoLibrary" {
     try t.expectError(error.NoLibrary, resolve(t.allocator, t.io, .{ .start_dir = "/", .config_path = "/nonexistent" }));
+}
+
+test "write_mu round-trips a lock so every server writer can rely on it" {
+    try write_mu.lock(t.io);
+    write_mu.unlock(t.io);
+}
+
+test "writeFileAtomic lands content and leaves no temp file behind" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+    const dest = try std.fs.path.join(t.allocator, &.{ root, "index.html" });
+    defer t.allocator.free(dest);
+
+    try writeFileAtomic(t.io, t.allocator, dest, "first");
+    try writeFileAtomic(t.io, t.allocator, dest, "second");
+
+    const read_back = try tmp.dir.readFileAlloc(t.io, "index.html", t.allocator, .limited(64));
+    defer t.allocator.free(read_back);
+    try t.expectEqualStrings("second", read_back);
+    try t.expectError(error.FileNotFound, tmp.dir.readFileAlloc(t.io, ".index.html.tmp", t.allocator, .limited(64)));
 }
