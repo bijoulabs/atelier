@@ -4,6 +4,7 @@ const index = @import("index.zig");
 const history = @import("history.zig");
 const theme = @import("theme.zig");
 const json = @import("json.zig");
+const mcp = @import("mcp.zig");
 
 pub const Route = union(enum) {
     file: []const u8,
@@ -15,6 +16,7 @@ pub const Route = union(enum) {
     theme_data,
     theme_save,
     theme_apply,
+    mcp,
     reload,
     bad,
 
@@ -53,6 +55,7 @@ pub fn mapPath(alloc: std.mem.Allocator, raw_target: []const u8) !Route {
     if (std.mem.eql(u8, target, "/__theme/data")) return .theme_data;
     if (std.mem.eql(u8, target, "/__theme/save")) return .theme_save;
     if (std.mem.eql(u8, target, "/__theme/apply")) return .theme_apply;
+    if (std.mem.eql(u8, target, "/mcp")) return .mcp;
     if (std.mem.indexOfScalar(u8, target, '\\') != null) return .bad;
     if (!std.mem.startsWith(u8, target, "/")) return .bad;
     var it = std.mem.splitScalar(u8, target[1..], '/');
@@ -247,7 +250,6 @@ pub fn run(io: std.Io, lib: library.Library, port: u16, reload: bool) !void {
 /// connections; this is the same allocator `treeSignature` already uses for
 /// its per-scan walker allocations, for the same reason.
 fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, peer: net.IpAddress, reload: bool) void {
-    _ = peer; // consumed by the /mcp arm once the MCP route lands
     // Every path closes `stream` except a successfully-registered SSE
     // client (Task 7): that connection has to stay open so the scanner can
     // push events down it later, well after this function has returned.
@@ -284,11 +286,15 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, peer: net.IpAddr
     }
 
     const route = mapPath(a, target) catch return;
-    // POST exists for exactly two routes, the theme editor's save and
-    // apply; the server is GET-only everywhere else on purpose (an open
-    // tailnet port must not modify the library beyond themes/ and the
-    // manifest's theme line).
-    const wants_post = route == .theme_save or route == .theme_apply;
+    // POST exists for the theme editor's save and apply and for /mcp, the
+    // remote authoring surface. This is a deliberate access-model
+    // decision: the port is unauthenticated and intended for trusted
+    // private networks (a tailnet), and anyone who can reach it is
+    // trusted with full authoring. Every mutation is path-validated,
+    // size-capped, serialized under library.write_mu, attributed to the
+    // peer (identity.zig), and, when asked, committed to the library's
+    // own git history, which is the audit trail.
+    const wants_post = route == .theme_save or route == .theme_apply or route == .mcp;
     if (is_post != wants_post) {
         return writeBody(stream, io, "405 Method Not Allowed", "text/plain", "wrong method\n");
     }
@@ -296,14 +302,19 @@ fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, peer: net.IpAddr
         .bad => return writeBody(stream, io, "400 Bad Request", "text/plain", "bad path\n"),
         .theme_editor => return writeBody(stream, io, "200 OK", "text/html; charset=utf-8", theme_editor_html),
         .theme_data => return handleThemeData(a, io, root, stream),
-        .theme_save, .theme_apply => {
+        .theme_save, .theme_apply, .mcp => {
             const content_length = parseContentLength(head) orelse {
                 return writeBody(stream, io, "411 Length Required", "text/plain", "length required\n");
             };
-            if (content_length > save_body_bytes_max) {
+            if (content_length > bodyCapFor(route)) {
                 return writeBody(stream, io, "413 Content Too Large", "text/plain", "body too large\n");
             }
-            const body = readBody(a, io, stream, buf[header_end..have], content_length) orelse return;
+            // curl holds the body back until the server blesses an
+            // Expect: 100-continue; real MCP clients rarely send it, but
+            // the manual-test client of record does.
+            if (headerHasExpectContinue(head)) writeContinue(stream, io);
+            const body = readBody(a, io, stream, buf[header_end..have], content_length, bodyCapFor(route)) orelse return;
+            if (route == .mcp) return handleMcp(a, io, root, stream, peer, body);
             if (route == .theme_apply) return handleThemeApply(a, io, root, stream, body);
             return handleThemeSave(a, io, root, stream, body);
         },
@@ -388,12 +399,61 @@ const theme_editor_html = @embedFile("assets/theme_editor.html");
 /// palette is under 4 KB; 64 KB leaves an order of magnitude of slack.
 const save_body_bytes_max = 64 * 1024;
 
+/// Upper bound on an /mcp request body: a whole document plus its JSON
+/// escaping overhead, matching the 4 MB page-read cap the commands use.
+pub const mcp_body_bytes_max = 4 * 1024 * 1024;
+
+/// The body cap for a POST route. Pure so the pairing of route and cap
+/// is pinned by test rather than scattered across the switch.
+fn bodyCapFor(route: Route) usize {
+    return switch (route) {
+        .theme_save, .theme_apply => save_body_bytes_max,
+        .mcp => mcp_body_bytes_max,
+        // Negative space: no other route reads a body.
+        else => unreachable,
+    };
+}
+
+/// Whether the raw header block asks for a 100-continue handshake, the
+/// same case-insensitive scan as `parseContentLength`.
+fn headerHasExpectContinue(headers: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "expect")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.ascii.eqlIgnoreCase(value, "100-continue");
+    }
+    return false;
+}
+
+/// Blesses a pending Expect: 100-continue so the client sends the body.
+/// Errors are swallowed: a peer that vanished here surfaces as the short
+/// read in `readBody` right after.
+fn writeContinue(stream: net.Stream, io: std.Io) void {
+    var hdr_buf: [64]u8 = undefined;
+    var w = stream.writer(io, &hdr_buf);
+    w.interface.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return;
+    w.interface.flush() catch return;
+}
+
+/// Serves POST /mcp: hands the raw body to mcp.handle (which owns all
+/// JSON-RPC framing) and maps its socket-free result onto the wire. 202
+/// carries no body per the streamable HTTP spec's notification rule.
+fn handleMcp(a: std.mem.Allocator, io: std.Io, root: []const u8, stream: net.Stream, peer: net.IpAddress, body: []const u8) void {
+    switch (mcp.handle(a, io, root, peer, body)) {
+        .json => |payload| return writeBody(stream, io, "200 OK", "application/json", payload),
+        .accepted => return writeBody(stream, io, "202 Accepted", "text/plain", ""),
+        .parse_error => |payload| return writeBody(stream, io, "400 Bad Request", "application/json", payload),
+    }
+}
+
 /// Reads a POST body of exactly `len` bytes: whatever arrived past the
 /// headers first (`pre`), then the socket until complete. Null on any
 /// short read; the connection just drops, like every other parse
 /// failure in `handleConn`.
-fn readBody(alloc: std.mem.Allocator, io: std.Io, stream: net.Stream, pre: []const u8, len: usize) ?[]u8 {
-    std.debug.assert(len <= save_body_bytes_max);
+fn readBody(alloc: std.mem.Allocator, io: std.Io, stream: net.Stream, pre: []const u8, len: usize, cap: usize) ?[]u8 {
+    std.debug.assert(len <= cap);
     const body = alloc.alloc(u8, len) catch return null;
     const pre_n = @min(pre.len, len);
     @memcpy(body[0..pre_n], pre[0..pre_n]);
@@ -938,6 +998,32 @@ test "mapPath basics" {
         defer t.allocator.free(route.file);
         try t.expectEqualStrings(c.want, route.file);
     }
+}
+
+test "mapPath routes /mcp exactly, with or without a query" {
+    try t.expect((try mapPath(t.allocator, "/mcp")) == .mcp);
+    try t.expect((try mapPath(t.allocator, "/mcp?x=1")) == .mcp);
+    // Negative space: near-misses are ordinary files, never the endpoint.
+    const near_misses = [_][]const u8{ "/mcpx", "/MCP", "/mcp/extra", "/mcp.html" };
+    for (near_misses) |target| {
+        const route = try mapPath(t.allocator, target);
+        try t.expect(route == .file);
+        t.allocator.free(route.file);
+    }
+}
+
+test "bodyCapFor gives the theme routes their small cap and mcp its big one" {
+    try t.expectEqual(save_body_bytes_max, bodyCapFor(.theme_save));
+    try t.expectEqual(save_body_bytes_max, bodyCapFor(.theme_apply));
+    try t.expectEqual(mcp_body_bytes_max, bodyCapFor(.mcp));
+}
+
+test "headerHasExpectContinue scans case-insensitively" {
+    try t.expect(headerHasExpectContinue("POST /mcp HTTP/1.1\r\nExpect: 100-continue\r\n\r\n"));
+    try t.expect(headerHasExpectContinue("POST /mcp HTTP/1.1\r\nexpect: 100-Continue\r\n\r\n"));
+    try t.expect(!headerHasExpectContinue("POST /mcp HTTP/1.1\r\nContent-Length: 2\r\n\r\n"));
+    // Negative space: the token in a header value other than Expect.
+    try t.expect(!headerHasExpectContinue("POST /x HTTP/1.1\r\nX-Note: 100-continue\r\n\r\n"));
 }
 
 test "mapPath reload and traversal" {
