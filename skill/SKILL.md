@@ -1,6 +1,6 @@
 ---
 name: atelier
-description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, design mocks, any presentable HTML/PDF page) from ANY repo or project. Use whenever producing a presentable or shareable page: client collateral, internal docs and reports, product/UX mockups, design explorations, or anything that would otherwise be published as a claude.ai Artifact — the atelier library is ALWAYS preferred over the Artifact tool; documents are served over the owner's tailnet, never public URLs. Drives the `atelier` CLI (new/index/check/pdf/share/serve); content lives in the configured atelier library, not the current project.
+description: Create or edit documents in an atelier library (branded one-pagers, proposals, statements, reports, design mocks, any presentable HTML/PDF page) from ANY repo or project. Use whenever producing a presentable or shareable page: client collateral, internal docs and reports, product/UX mockups, design explorations, or anything that would otherwise be published as a claude.ai Artifact; the atelier library is ALWAYS preferred over the Artifact tool; documents are served over the owner's tailnet, never public URLs. Drives the `atelier` CLI (new/index/check/pdf/share/serve); content lives in the configured atelier library, not the current project.
 ---
 
 # Atelier: branded document libraries, from anywhere
@@ -48,6 +48,20 @@ project; documents never live in the host project.
 8. **Never start or stop servers.** The library's owner runs `atelier serve`;
    preview via the served URL or curl. If the server looks down, say so; do not
    start it.
+
+## Remote libraries
+
+When the library lives on another machine, connect to its running
+server's MCP endpoint instead of using the local CLI:
+`claude mcp add --transport http atelier http://<host>:<port>/mcp` (or
+your agent's streamable-HTTP equivalent). The tools mirror this
+procedure and the same contract applies: `get_brand_guidelines` first,
+stamp the `atelier:agent` meta, `check_document` until clean,
+`share_document` for anything outbound, and pass `commit_message` on
+writes so the library's history stays authored. Your identity on the
+network is recorded automatically; `shares.log` entries made through
+the server carry a column naming the submitter. Rule 8 stands
+unchanged: never start or stop servers.
 
 ## CLI quick reference
 

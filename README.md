@@ -66,10 +66,10 @@ saves, and applies without you touching a config.
 
 ![The theme editor: paint dabs on the left, the real index following along](docs/theme-editor.png)
 
-Saving and applying are the server's only two write routes, both
-narrow and audited; everything else is GET. New pages scaffold
-on-brand via `{{BRAND_*}}` placeholders. A good new preset is a
-welcome one-file PR.
+Theme save and apply are two of the server's three write surfaces (the
+third is remote authoring, below), each narrow and audited; everything
+else is GET. New pages scaffold on-brand via `{{BRAND_*}}` placeholders.
+A good new preset is a welcome one-file PR.
 
 <details>
 <summary>The full field list</summary>
@@ -92,6 +92,45 @@ manifest; the defaults have opinions.
 Pages may carry `<meta name="atelier:KEY" content="...">` tags; all of
 it is searchable from the index, and `atelier:agent` / `atelier:client`
 become stamps and filter chips on the ledger.
+
+## Remote authoring
+
+The running server is also an MCP server: `POST /mcp`, streamable HTTP,
+stateless. Teammates point whatever agent they use at it and author
+documents in the library without installing anything; the binary and
+the library stay on the serve machine.
+
+    claude mcp add --transport http atelier http://<host>:<port>/mcp
+
+(or your agent's streamable-HTTP MCP equivalent). The tools mirror the
+CLI: `get_brand_guidelines`, `list_documents`, `read_document`,
+`check_document`, `list_templates`, `write_document`,
+`new_from_template`, `share_document`, `render_pdf`, `reindex`. The
+server's `initialize` response carries the authoring contract; agents
+that honor instructions need no further briefing.
+
+**The port trusts its network.** There is no authentication by design:
+run the server only on a trusted private network (a Tailscale tailnet,
+a LAN you control) and never expose it further. Within that boundary,
+every mutation is path-fenced, size-capped, serialized, and attributed:
+
+- Writes may only create or update documents (`.html`, `.css`, `.js`,
+  `.svg`, `.md`, `.txt`). The generated `index.html`, the manifest,
+  `shares.log`, `brand-guidelines.md`, `themes/`, and `shares/` are
+  not remotely writable.
+- Pass `commit_message` and the server commits the change to the
+  library repo. When the host runs Tailscale, the commit is authored
+  `<user> via <machine>` from `tailscale whois` on the peer address
+  (the committer stays the repository's own identity), so `git log`
+  answers who sent what from where. Without Tailscale, attribution
+  degrades gracefully to the peer address; nothing else changes.
+- Exports land in `<library>/shares/`: served over HTTP, listed in
+  `shares.log` (with a column naming the submitter), kept off the
+  ledger. Rendering needs Chromium on the serve machine.
+
+One small shadow: the `/mcp` path wins over a root-level file that
+would serve there, the same shadowing as `/__theme`. Requests need a
+`Content-Length` (no chunked bodies).
 
 ## Commands
 

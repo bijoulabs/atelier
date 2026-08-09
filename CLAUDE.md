@@ -32,19 +32,31 @@ doc comment. The source is full of examples of this habit.
 ## Architecture
 
 `cli/src/main.zig` dispatches; one module per concern: `library.zig`
-(resolution: explicit path > nearest ancestor manifest > config file),
-`theme.zig` (named themes, presets, overlays, editor save validation),
-`template.zig`, `index.zig` (ledger generation; its CSS variable names
-are pinned by test because the theme editor writes them), `history.zig`
-(git wrappers for time travel), `pdf.zig` (headless Chromium),
-`check.zig`, `share.zig`, and `serve.zig`.
+(resolution: explicit path > nearest ancestor manifest > config file;
+also `write_mu` and `writeFileAtomic`), `theme.zig` (named themes,
+presets, overlays, editor save validation), `template.zig` (fill plus
+the scaffold core), `index.zig` (ledger generation; its CSS variable
+names are pinned by test because the theme editor writes them),
+`history.zig` (git wrappers: read for time travel, commitPaths for
+server-side authorship), `pdf.zig` (headless Chromium), `check.zig`,
+`share.zig` (the share core, used by CLI and server), `serve.zig`,
+`mcp.zig` (the JSON-RPC endpoint and its tools), and `identity.zig`
+(peer attribution, optional tailscale whois).
 
 serve.zig is hand-rolled HTTP/1.1 over `std.Io.net`; do NOT switch it to
-`std.http.Server` (its API churns across dev versions). GET-only except
-`POST /__theme/save` and `POST /__theme/apply`, the entire write
-surface. One detached thread per connection and per-connection
-`page_allocator` arenas are load-bearing (SSE outlives requests); read
-the `handleConn` doc comment before touching allocation there.
+`std.http.Server` (its API churns across dev versions). The write
+surface is `POST /__theme/save`, `POST /__theme/apply`, and `POST /mcp`
+(remote authoring; stateless streamable HTTP, plain JSON responses, no
+sessions, and no SSE on /mcp by design). Every library mutation the
+server performs takes `library.write_mu`. One detached thread per
+connection and per-connection `page_allocator` arenas are load-bearing
+(SSE outlives requests); read the `handleConn` doc comment before
+touching allocation there.
+
+CLI commands and MCP tools share one implementation: the cores live in
+their modules (`template.scaffold`, `share.sharePage`,
+`pdf.materializeRev`, `check.checkPage`); `main.zig` and `mcp.zig` are
+thin callers. Edit behavior in the core, never in one caller.
 
 ## Conventions
 
