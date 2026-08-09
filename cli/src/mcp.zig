@@ -14,6 +14,7 @@ const library = @import("library.zig");
 const index = @import("index.zig");
 const check = @import("check.zig");
 const template = @import("template.zig");
+const history = @import("history.zig");
 
 /// Protocol revisions this endpoint knows how to speak. `initialize`
 /// echoes a requested version from this set and otherwise answers with
@@ -113,6 +114,34 @@ const tool_defs = [_]ToolDef{
         .description = "The library's templates and each one's placeholders, for new_from_template.",
         .input_schema = "{\"type\":\"object\",\"properties\":{}}",
         .handler = toolListTemplates,
+    },
+    .{
+        .name = "write_document",
+        .description = "Write a complete document into the library. Creates by default and refuses an existing path; pass overwrite to update. Pass commit_message so the change lands in the library's history under your identity.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"library-relative destination, e.g. advisory/two; .html is appended when the last segment has no extension\"}," ++
+            "\"content\":{\"type\":\"string\",\"description\":\"the complete file content\"}," ++
+            "\"overwrite\":{\"type\":\"boolean\",\"default\":false}," ++
+            "\"commit_message\":{\"type\":\"string\",\"description\":\"why, one line, no trailers; omit to leave the write uncommitted\"}}," ++
+            "\"required\":[\"path\",\"content\"]}",
+        .handler = toolWriteDocument,
+    },
+    .{
+        .name = "new_from_template",
+        .description = "Scaffold a new document from a library template. Brand tokens fill from the active theme; your vars win over them. Refuses to overwrite.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++
+            "\"template\":{\"type\":\"string\",\"description\":\"a name from list_templates\"}," ++
+            "\"dest\":{\"type\":\"string\",\"description\":\"library-relative destination\"}," ++
+            "\"vars\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"},\"description\":\"placeholder values, e.g. {\\\"CLIENT\\\":\\\"Acme\\\"}\"}," ++
+            "\"commit_message\":{\"type\":\"string\"}}," ++
+            "\"required\":[\"template\",\"dest\"]}",
+        .handler = toolNewFromTemplate,
+    },
+    .{
+        .name = "reindex",
+        .description = "Rebuild the library's index.html now. Normally unnecessary: the server reindexes within about a second of any write when live reload is on; this exists for servers running with reload off.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = toolReindex,
     },
 };
 
@@ -305,6 +334,150 @@ fn resolveLib(ctx: *const ToolContext) !library.Library {
         .start_dir = "/",
         .config_path = "/nonexistent",
     });
+}
+
+/// What write_document may target: a safe path whose extension is
+/// authorable text, excluding everything the binary generates or owns a
+/// validated write path for (the ledger, the manifest, the share ledger,
+/// the owner-authored canon, the theme editor's directory, the export
+/// directory). templates/ stays writable: masters are content and git
+/// records who changed them.
+pub fn isWritableRelPath(rel: []const u8) bool {
+    if (!isSafeRelPath(rel)) return false;
+    const writable_extensions = [_][]const u8{ ".html", ".css", ".js", ".svg", ".md", ".txt" };
+    const ext = std.fs.path.extension(rel);
+    const ext_ok = for (writable_extensions) |known| {
+        if (std.mem.eql(u8, ext, known)) break true;
+    } else false;
+    if (!ext_ok) return false;
+    const owned_files = [_][]const u8{ "index.html", "atelier.json", "shares.log", "brand-guidelines.md" };
+    for (owned_files) |owned| {
+        if (std.mem.eql(u8, rel, owned)) return false;
+    }
+    if (std.mem.startsWith(u8, rel, "themes/")) return false;
+    if (std.mem.startsWith(u8, rel, "shares/")) return false;
+    return true;
+}
+
+/// A boolean argument by name; absent or non-boolean is `fallback`.
+fn argBool(arguments: std.json.ObjectMap, name: []const u8, fallback: bool) bool {
+    const value = arguments.get(name) orelse return fallback;
+    if (value != .bool) return fallback;
+    return value.bool;
+}
+
+/// Resolves who is asking and runs the optional commit, returning the
+/// attribution-and-commit tail every mutating tool ends its report with:
+/// "as <label>; committed <sha>" or the reason there is no commit. Must
+/// be called with library.write_mu held, so the commit cannot interleave
+/// with a concurrent writer's staging.
+fn attributeAndCommit(
+    ctx: *const ToolContext,
+    rel_paths: []const []const u8,
+    commit_message: ?[]const u8,
+) ![]u8 {
+    const who = identity.resolve(ctx.alloc, ctx.io, ctx.peer);
+    const who_label = identity.label(ctx.alloc, who) catch "unknown";
+    const commit_note: []const u8 = blk: {
+        const message = commit_message orelse break :blk "no commit requested";
+        if (message.len == 0) break :blk "no commit requested";
+        const author = identity.gitAuthor(ctx.alloc, who) catch null;
+        const outcome = history.commitPaths(ctx.alloc, ctx.io, ctx.root, rel_paths, message, author);
+        if (outcome.committed) break :blk try std.fmt.allocPrint(ctx.alloc, "committed {s}", .{outcome.sha});
+        break :blk try std.fmt.allocPrint(ctx.alloc, "not committed: {s}", .{outcome.note});
+    };
+    return std.fmt.allocPrint(ctx.alloc, "as {s}; {s}", .{ who_label, commit_note });
+}
+
+/// The served URL for a library-relative path: clean for pages, verbatim
+/// for everything else.
+fn servedUrl(alloc: std.mem.Allocator, rel: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, rel, ".html")) {
+        return std.fmt.allocPrint(alloc, "/{s}", .{rel[0 .. rel.len - ".html".len]});
+    }
+    return std.fmt.allocPrint(alloc, "/{s}", .{rel});
+}
+
+fn toolWriteDocument(ctx: *const ToolContext) anyerror!ToolResult {
+    const raw = argString(ctx.arguments, "path") orelse return toolError(ctx.alloc, "path is required", .{});
+    const content = argString(ctx.arguments, "content") orelse return toolError(ctx.alloc, "content is required", .{});
+    const rel = try cleanRel(ctx.alloc, raw);
+    if (!isWritableRelPath(rel)) {
+        return toolError(ctx.alloc, "cannot write {s}: only .html/.css/.js/.svg/.md/.txt documents, and never index.html, atelier.json, shares.log, brand-guidelines.md, themes/, or shares/", .{rel});
+    }
+    const abs = try std.fs.path.join(ctx.alloc, &.{ ctx.root, rel });
+
+    library.write_mu.lock(ctx.io) catch return toolError(ctx.alloc, "server shutting down", .{});
+    defer library.write_mu.unlock(ctx.io);
+
+    if (!argBool(ctx.arguments, "overwrite", false)) {
+        if (std.Io.Dir.cwd().access(ctx.io, abs, .{})) |_| {
+            return toolError(ctx.alloc, "refusing to overwrite {s}; pass overwrite true to update it", .{rel});
+        } else |_| {} // no existing file to protect; the write surfaces real errors
+    }
+    if (std.fs.path.dirname(abs)) |parent| try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+    try library.writeFileAtomic(ctx.io, ctx.alloc, abs, content);
+
+    const tail = try attributeAndCommit(ctx, &.{rel}, argString(ctx.arguments, "commit_message"));
+    const url = try servedUrl(ctx.alloc, rel);
+    return .{ .text = try std.fmt.allocPrint(ctx.alloc, "wrote {s} (served at {s}) {s}", .{ rel, url, tail }) };
+}
+
+fn toolNewFromTemplate(ctx: *const ToolContext) anyerror!ToolResult {
+    const template_name = argString(ctx.arguments, "template") orelse {
+        return toolError(ctx.alloc, "template is required", .{});
+    };
+    const dest = argString(ctx.arguments, "dest") orelse return toolError(ctx.alloc, "dest is required", .{});
+    const dest_rel = try cleanRel(ctx.alloc, dest);
+    if (!isWritableRelPath(dest_rel)) return toolError(ctx.alloc, "cannot write {s}", .{dest_rel});
+
+    var user_vars = std.StringHashMap([]const u8).init(ctx.alloc);
+    defer user_vars.deinit();
+    if (ctx.arguments.get("vars")) |vars_value| {
+        if (vars_value == .object) {
+            var entries = vars_value.object.iterator();
+            while (entries.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue; // only strings substitute into a template
+                try user_vars.put(entry.key_ptr.*, entry.value_ptr.*.string);
+            }
+        }
+    }
+
+    const lib = try resolveLib(ctx);
+    library.write_mu.lock(ctx.io) catch return toolError(ctx.alloc, "server shutting down", .{});
+    defer library.write_mu.unlock(ctx.io);
+
+    var diag: template.ScaffoldDiag = .{};
+    const scaffolded = template.scaffold(ctx.alloc, ctx.io, lib, template_name, dest, &user_vars, &diag) catch |e| switch (e) {
+        error.TemplateNotFound => return toolError(ctx.alloc, "no template named {s}; list_templates shows what exists", .{template_name}),
+        error.DestinationExists => return toolError(ctx.alloc, "refusing to overwrite {s}; write_document with overwrite true updates it", .{dest_rel}),
+        else => return e,
+    };
+
+    const tail = try attributeAndCommit(ctx, &.{scaffolded.dest_rel}, argString(ctx.arguments, "commit_message"));
+    const url = try servedUrl(ctx.alloc, scaffolded.dest_rel);
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(ctx.alloc);
+    const head = try std.fmt.allocPrint(ctx.alloc, "wrote {s} (served at {s}) {s}", .{ scaffolded.dest_rel, url, tail });
+    try text.appendSlice(ctx.alloc, head);
+    if (scaffolded.unfilled.len > 0) {
+        try text.appendSlice(ctx.alloc, "; unfilled:");
+        for (scaffolded.unfilled) |placeholder| {
+            try text.append(ctx.alloc, ' ');
+            try text.appendSlice(ctx.alloc, placeholder);
+        }
+    }
+    return .{ .text = try text.toOwnedSlice(ctx.alloc) };
+}
+
+fn toolReindex(ctx: *const ToolContext) anyerror!ToolResult {
+    const lib = try resolveLib(ctx);
+    library.write_mu.lock(ctx.io) catch return toolError(ctx.alloc, "server shutting down", .{});
+    defer library.write_mu.unlock(ctx.io);
+    const page = try index.generate(ctx.alloc, ctx.io, lib);
+    const dest = try std.fs.path.join(ctx.alloc, &.{ lib.root, "index.html" });
+    try library.writeFileAtomic(ctx.io, ctx.alloc, dest, page);
+    return .{ .text = "index.html rebuilt" };
 }
 
 fn toolGetBrandGuidelines(ctx: *const ToolContext) anyerror!ToolResult {
@@ -777,6 +950,166 @@ test "check_document reports structured findings without failing the call" {
         "\"params\":{\"name\":\"check_document\"}}"));
     const all_report = try std.json.parseFromSlice(std.json.Value, a, all.text, .{});
     try t.expectEqual(@as(i64, 1), all_report.value.object.get("pages").?.integer);
+}
+
+test "isWritableRelPath fences what the binary owns and the wrong types" {
+    const good = [_][]const u8{
+        "memo.html", "advisory/one.html",     "css/site.css", "notes.md",
+        "logo.svg",  "templates/master.html",
+    };
+    for (good) |p| try t.expect(isWritableRelPath(p));
+    const bad = [_][]const u8{
+        // The binary's own files and validated write paths.
+        "index.html",          "atelier.json",  "shares.log",
+        "brand-guidelines.md", "themes/x.json", "themes/x.css",
+        "shares/x.html",
+        // Wrong types for an authoring surface.
+              "deck.pdf",      "tool.exe",
+        "photo.png",
+        // Shape violations stay violations.
+                  "../x.html",     "/abs.html",
+        ".hidden.html",
+    };
+    for (bad) |p| try t.expect(!isWritableRelPath(p));
+}
+
+test "write_document creates, refuses, overwrites, and reports" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+
+    const created = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"write_document\",\"arguments\":{\"path\":\"notes/deep/first\",\"content\":\"<title>F</title>\"}}}"));
+    try t.expect(!created.is_error);
+    try t.expect(std.mem.indexOf(u8, created.text, "wrote notes/deep/first.html") != null);
+    try t.expect(std.mem.indexOf(u8, created.text, "as local") != null);
+    const written = try tmp.dir.readFileAlloc(t.io, "notes/deep/first.html", a, .limited(4096));
+    try t.expectEqualStrings("<title>F</title>", written);
+    // No stray atomic-write temp.
+    try t.expectError(error.FileNotFound, tmp.dir.readFileAlloc(t.io, "notes/deep/.first.html.tmp", a, .limited(64)));
+
+    const refused = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"write_document\",\"arguments\":{\"path\":\"notes/deep/first\",\"content\":\"clobber\"}}}"));
+    try t.expect(refused.is_error);
+    const kept = try tmp.dir.readFileAlloc(t.io, "notes/deep/first.html", a, .limited(4096));
+    try t.expectEqualStrings("<title>F</title>", kept);
+
+    const replaced = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"write_document\",\"arguments\":{\"path\":\"notes/deep/first\",\"content\":\"v2\",\"overwrite\":true}}}"));
+    try t.expect(!replaced.is_error);
+    const second = try tmp.dir.readFileAlloc(t.io, "notes/deep/first.html", a, .limited(4096));
+    try t.expectEqualStrings("v2", second);
+}
+
+test "write_document fences the library's own files" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{\"name\":\"Keep\"}" });
+
+    const fenced_targets = [_][]const u8{ "atelier.json", "index.html", "themes/evil.css", "../escape" };
+    inline for (fenced_targets) |target| {
+        const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+            "\"params\":{\"name\":\"write_document\",\"arguments\":{\"path\":\"" ++ target ++ "\",\"content\":\"x\",\"overwrite\":true}}}"));
+        try t.expect(outcome.is_error);
+    }
+    const manifest = try tmp.dir.readFileAlloc(t.io, "atelier.json", a, .limited(4096));
+    try t.expectEqualStrings("{\"name\":\"Keep\"}", manifest);
+}
+
+test "write_document commits when asked and reports the outcome" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+
+    // Outside a repository the write stands and the report says why the
+    // commit did not happen. (The tmp dir sits inside this project's own
+    // repo via .zig-cache, so init a nested one to keep git contained.)
+    inline for (.{
+        .{ "git", "-C", root, "init", "-q" },
+        .{ "git", "-C", root, "config", "user.name", "Owner" },
+        .{ "git", "-C", root, "config", "user.email", "owner@example.com" },
+    }) |argv| {
+        const run = std.process.run(a, t.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        }) catch return error.SkipZigTest;
+        switch (run.term) {
+            .exited => |code| if (code != 0) return error.SkipZigTest,
+            else => return error.SkipZigTest,
+        }
+    }
+
+    const committed = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"write_document\",\"arguments\":{\"path\":\"memo\",\"content\":\"<title>M</title>\"," ++
+        "\"commit_message\":\"add the memo\"}}}"));
+    try t.expect(!committed.is_error);
+    try t.expect(std.mem.indexOf(u8, committed.text, "committed ") != null);
+
+    const log_run = try std.process.run(a, t.io, .{
+        .argv = &.{ "git", "-C", root, "log", "-1", "--format=%an|%s" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    // Loopback peers are the owner: no author override.
+    try t.expectEqualStrings("Owner|add the memo", std.mem.trimEnd(u8, log_run.stdout, "\n"));
+}
+
+test "new_from_template scaffolds with brand seeding and reports unfilled" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.createDirPath(t.io, "templates");
+    try tmp.dir.writeFile(t.io, .{
+        .sub_path = "templates/memo.html",
+        .data = "{{BRAND_PAPER}}|{{CLIENT}}|{{MISSING}}",
+    });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"new_from_template\",\"arguments\":{\"template\":\"memo\",\"dest\":\"notes/second\"," ++
+        "\"vars\":{\"CLIENT\":\"Globex\"}}}}"));
+    try t.expect(!outcome.is_error);
+    try t.expect(std.mem.indexOf(u8, outcome.text, "unfilled: MISSING") != null);
+    const written = try tmp.dir.readFileAlloc(t.io, "notes/second.html", a, .limited(4096));
+    const expected = try std.fmt.allocPrint(a, "{s}|Globex|{{{{MISSING}}}}", .{library.Theme.neutral.paper});
+    try t.expectEqualStrings(expected, written);
+
+    const missing_template = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"new_from_template\",\"arguments\":{\"template\":\"ghost\",\"dest\":\"anything\"}}}"));
+    try t.expect(missing_template.is_error);
+}
+
+test "reindex rebuilds the ledger on demand" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "page.html", .data = "<title>P</title>" });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"reindex\"}}"));
+    try t.expect(!outcome.is_error);
+    const ledger = try tmp.dir.readFileAlloc(t.io, "index.html", a, .limited(1024 * 1024));
+    try t.expect(std.mem.indexOf(u8, ledger, "P") != null);
 }
 
 test "list_templates names each master and its placeholders" {
