@@ -77,6 +77,122 @@ pub fn render(alloc: std.mem.Allocator, io: std.Io, page_abs: []const u8, out_ab
     return error.NoChromium;
 }
 
+/// Upper bound on a `git show` read for one page revision; matches the
+/// page-read cap used across the CLI commands.
+pub const rev_bytes_max = 4 * 1024 * 1024;
+
+/// Materializes `rev:page_rel` from the repository at `root` into a
+/// temporary dot-file beside the page (`.<stem>-<rev>.html`), so relative
+/// assets resolve against the working tree, a documented approximation.
+/// Returns the temp's absolute path; the caller deletes it after
+/// rendering. `rev` is any revspec git accepts: for the CLI that is the
+/// operator's own argv, while network callers must gate it first
+/// (`history.isCommitSha`), because the spec lands in an argv here.
+pub fn materializeRev(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    page_rel: []const u8,
+    rev: []const u8,
+) ![]u8 {
+    std.debug.assert(std.fs.path.isAbsolute(root));
+    std.debug.assert(!std.fs.path.isAbsolute(page_rel));
+    std.debug.assert(std.mem.endsWith(u8, page_rel, ".html"));
+    std.debug.assert(rev.len > 0);
+
+    const spec = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ rev, page_rel });
+    const run = std.process.run(alloc, io, .{
+        .argv = &.{ "git", "-C", root, "show", spec },
+        .stdout_limit = .limited(rev_bytes_max),
+        .stderr_limit = .limited(4096),
+    }) catch return error.GitUnavailable;
+    switch (run.term) {
+        .exited => |code| if (code != 0) return error.GitShowFailed,
+        else => return error.GitShowFailed,
+    }
+
+    const page_abs = try std.fs.path.join(alloc, &.{ root, page_rel });
+    const page_dir = std.fs.path.dirname(page_abs) orelse root;
+    const base = std.fs.path.basename(page_rel);
+    const temp_abs = try std.fmt.allocPrint(alloc, "{s}/.{s}-{s}.html", .{
+        page_dir,
+        base[0 .. base.len - ".html".len],
+        rev,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_abs, .data = run.stdout });
+    return temp_abs;
+}
+
+test "materializeRev writes the committed content to a dot-file beside the page" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    inline for (.{
+        .{ "git", "-C", root, "init", "-q" },
+        .{ "git", "-C", root, "config", "user.name", "Owner" },
+        .{ "git", "-C", root, "config", "user.email", "owner@example.com" },
+    }) |argv| {
+        const run = std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        }) catch return error.SkipZigTest;
+        defer std.testing.allocator.free(run.stdout);
+        defer std.testing.allocator.free(run.stderr);
+        switch (run.term) {
+            .exited => |code| if (code != 0) return error.SkipZigTest,
+            else => return error.SkipZigTest,
+        }
+    }
+    try tmp.dir.createDirPath(std.testing.io, "advisory");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "advisory/one.html", .data = "committed content" });
+    inline for (.{
+        .{ "git", "-C", root, "add", "advisory/one.html" },
+        .{ "git", "-C", root, "commit", "-q", "-m", "add" },
+    }) |argv| {
+        const run = try std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        std.testing.allocator.free(run.stdout);
+        std.testing.allocator.free(run.stderr);
+    }
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "advisory/one.html", .data = "working tree content" });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const temp_abs = try materializeRev(arena.allocator(), std.testing.io, root, "advisory/one.html", "HEAD");
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, temp_abs) catch {};
+    try std.testing.expect(std.mem.endsWith(u8, temp_abs, "/advisory/.one-HEAD.html"));
+    const materialized = try tmp.dir.readFileAlloc(std.testing.io, "advisory/.one-HEAD.html", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(materialized);
+    try std.testing.expectEqualStrings("committed content", materialized);
+}
+
+test "materializeRev on a bad revision is GitShowFailed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const init_run = std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "git", "-C", root, "init", "-q" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return error.SkipZigTest;
+    std.testing.allocator.free(init_run.stdout);
+    std.testing.allocator.free(init_run.stderr);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.GitShowFailed,
+        materializeRev(arena.allocator(), std.testing.io, root, "ghost.html", "HEAD"),
+    );
+}
+
 test "argv shape" {
     // The brief's sample test frees only the outer slice, which leaks the
     // two inner allocPrint'd strings (pdf_arg, url) under the leak-checking

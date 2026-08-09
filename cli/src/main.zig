@@ -179,9 +179,9 @@ fn cmdPdf(
     // a --rev temp copy.
     const named_page_abs = page_abs;
 
-    // --rev renders the page as it existed at a library revision: git
-    // show into a temporary dot-file beside the page (relative assets
-    // resolve against the working tree, a documented approximation).
+    // --rev renders the page as it existed at a library revision; the
+    // git-show-to-temp-dot-file pass lives in pdf.materializeRev, shared
+    // with the server's render_pdf tool.
     var rev_tmp: ?[]const u8 = null;
     defer if (rev_tmp) |tmp| std.Io.Dir.cwd().deleteFile(io, tmp) catch {}; // best effort; dot-files never index
     if (rev_flag) |rev| {
@@ -190,25 +190,17 @@ fn cmdPdf(
             std.process.exit(1);
         }
         const page_rel = if (std.mem.endsWith(u8, args[2], ".html")) args[2] else try std.fmt.allocPrint(alloc, "{s}.html", .{args[2]});
-        const spec = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ rev, page_rel });
-        const run = std.process.run(alloc, io, .{
-            .argv = &.{ "git", "-C", lib.root, "show", spec },
-        }) catch {
-            std.debug.print("git is unavailable; --rev needs it\n", .{});
-            std.process.exit(1);
+        const tmp = pdf.materializeRev(alloc, io, lib.root, page_rel, rev) catch |e| switch (e) {
+            error.GitUnavailable => {
+                std.debug.print("git is unavailable; --rev needs it\n", .{});
+                std.process.exit(1);
+            },
+            error.GitShowFailed => {
+                std.debug.print("git show {s}:{s} failed; check the revision and page\n", .{ rev, page_rel });
+                std.process.exit(1);
+            },
+            else => return e,
         };
-        const ok = switch (run.term) {
-            .exited => |code| code == 0,
-            else => false,
-        };
-        if (!ok) {
-            std.debug.print("git show {s} failed; check the revision and page\n", .{spec});
-            std.process.exit(1);
-        }
-        const page_dir = std.fs.path.dirname(page_abs) orelse lib.root;
-        const base = std.fs.path.basename(page_rel);
-        const tmp = try std.fmt.allocPrint(alloc, "{s}/.{s}-{s}.html", .{ page_dir, base[0 .. base.len - ".html".len], rev });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = run.stdout });
         rev_tmp = tmp;
         page_abs = tmp;
     }
@@ -347,28 +339,10 @@ fn cmdShare(
         try alloc.dupe(u8, args[2])
     else
         try std.fmt.allocPrint(alloc, "{s}.html", .{args[2]});
-    const page_abs = try std.fs.path.join(alloc, &.{ lib.root, page_rel });
-    const html = std.Io.Dir.cwd().readFileAlloc(io, page_abs, alloc, .limited(4 * 1024 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => {
-            std.debug.print("no page at {s}\n", .{page_abs});
-            std.process.exit(1);
-        },
-        else => return e,
-    };
-
-    const now_sec = std.Io.Clock.now(.real, io).toSeconds();
-    const date = try share.isoDate(alloc, now_sec);
-    const stamp = try share.stampSnippet(alloc, lib.name, recipient, date);
-    const stamped = try serve.injectAtBodyEnd(alloc, html, stamp);
-
-    const page_dir = std.fs.path.dirname(page_abs) orelse lib.root;
     const stem = blk: {
         const base = std.fs.path.basename(page_rel);
         break :blk base[0 .. base.len - ".html".len];
     };
-    const tmp_abs = try std.fmt.allocPrint(alloc, "{s}/.{s}-share.html", .{ page_dir, stem });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_abs, .data = stamped });
-    defer std.Io.Dir.cwd().deleteFile(io, tmp_abs) catch {}; // best effort; dot-files never index
 
     const out_abs = if (out_flag) |o| blk: {
         if (std.fs.path.isAbsolute(o)) break :blk try alloc.dupe(u8, o);
@@ -385,10 +359,16 @@ fn cmdShare(
         break :blk try std.fs.path.join(alloc, &.{ cwd, name });
     };
 
-    std.debug.assert(std.fs.path.isAbsolute(tmp_abs));
-    std.debug.assert(std.fs.path.isAbsolute(out_abs));
+    // The stamp/render/ledger pass lives in share.sharePage, shared with
+    // the server's share_document tool; local shares carry no identity
+    // column, the operator's own git identity is the record.
     var failure: ?pdf.Failure = null;
-    pdf.render(alloc, io, tmp_abs, out_abs, &failure) catch |e| switch (e) {
+    const result = share.sharePage(alloc, io, lib, page_rel, recipient, out_abs, null, &failure) catch |e| switch (e) {
+        error.PageNotFound => {
+            const page_abs = try std.fs.path.join(alloc, &.{ lib.root, page_rel });
+            std.debug.print("no page at {s}\n", .{page_abs});
+            std.process.exit(1);
+        },
         error.NoChromium => {
             std.debug.print("install chromium (or google-chrome-stable) for PDF rendering\n", .{});
             std.process.exit(1);
@@ -401,26 +381,8 @@ fn cmdShare(
         else => return e,
     };
 
-    // Library revision for reproducibility; "-" when git is unavailable.
-    const rev = blk: {
-        const run = std.process.run(alloc, io, .{
-            .argv = &.{ "git", "-C", lib.root, "rev-parse", "--short", "HEAD" },
-        }) catch break :blk try alloc.dupe(u8, "-");
-        const trimmed = std.mem.trim(u8, run.stdout, " \t\r\n");
-        break :blk if (trimmed.len > 0) trimmed else try alloc.dupe(u8, "-");
-    };
-
-    const line = try share.logLine(alloc, date, rev, page_rel, recipient, std.fs.path.basename(out_abs));
-    const log_abs = try std.fs.path.join(alloc, &.{ lib.root, "shares.log" });
-    const existing = std.Io.Dir.cwd().readFileAlloc(io, log_abs, alloc, .limited(1024 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => try alloc.dupe(u8, ""),
-        else => return e,
-    };
-    const combined = try std.fmt.allocPrint(alloc, "{s}{s}", .{ existing, line });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log_abs, .data = combined });
-
     std.debug.print("wrote {s}\n", .{out_abs});
-    std.debug.print("logged: {s}", .{line});
+    std.debug.print("logged: {s}", .{result.log_line});
 }
 
 /// Implements `atelier serve [path] [--port N] [--no-reload] [--library <path>]`.
