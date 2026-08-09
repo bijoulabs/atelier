@@ -211,7 +211,13 @@ pub fn run(io: std.Io, lib: library.Library, port: u16, reload: bool) !void {
 
     while (true) {
         const stream = server.accept(io) catch continue;
-        const th = std.Thread.spawn(.{}, handleConn, .{ io, lib.root, stream, reload }) catch {
+        // NOTE: this std's accept returns no separate address; the POSIX
+        // backend fills `socket.address` from accept(2)'s sockaddr
+        // out-param, so `stream.socket.address` IS the peer address (see
+        // Io/Threaded.zig netAcceptPosix). The MCP handlers resolve it to
+        // a tailnet identity for attribution.
+        const peer = stream.socket.address;
+        const th = std.Thread.spawn(.{}, handleConn, .{ io, lib.root, stream, peer, reload }) catch {
             stream.close(io);
             continue;
         };
@@ -240,7 +246,8 @@ pub fn run(io: std.Io, lib: library.Library, port: u16, reload: bool) !void {
 /// pages independently on `deinit`, regardless of overlap with other
 /// connections; this is the same allocator `treeSignature` already uses for
 /// its per-scan walker allocations, for the same reason.
-fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, reload: bool) void {
+fn handleConn(io: std.Io, root: []const u8, stream: net.Stream, peer: net.IpAddress, reload: bool) void {
+    _ = peer; // consumed by the /mcp arm once the MCP route lands
     // Every path closes `stream` except a successfully-registered SSE
     // client (Task 7): that connection has to stay open so the scanner can
     // push events down it later, well after this function has returned.

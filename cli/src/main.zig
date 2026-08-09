@@ -580,6 +580,7 @@ test {
     _ = @import("theme.zig");
     _ = @import("check.zig");
     _ = @import("share.zig");
+    _ = @import("identity.zig");
 }
 
 test "defaultConfigPath joins HOME with .config/atelier/config" {
