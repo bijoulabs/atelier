@@ -77,18 +77,9 @@ fn cmdNew(
     if (args.len < 4) usage(io, 1);
     const lib = try resolveFromArgs(alloc, io, environ, args, null);
 
-    var kv = std.StringHashMap([]const u8).init(alloc);
-    // Brand tokens from the resolved theme, seeded before --set so user
-    // pairs win; masters referencing {{BRAND_*}} scaffold with the current
-    // brand and the palette keeps one source.
-    try kv.put("BRAND_PAPER", lib.theme.paper);
-    try kv.put("BRAND_INK", lib.theme.ink);
-    try kv.put("BRAND_MUTED", lib.theme.muted);
-    try kv.put("BRAND_ACCENT", lib.theme.accent);
-    try kv.put("BRAND_RULE", lib.theme.rule);
-    try kv.put("BRAND_DISPLAY_FONT", lib.theme.display_font);
-    try kv.put("BRAND_MONO_FONT", lib.theme.mono_font);
-    try kv.put("BRAND_FONT_LINK", lib.theme.font_link);
+    // Only the --set pairs; {{BRAND_*}} seeding lives in template.scaffold
+    // so the CLI and the MCP tools share one palette source.
+    var user_vars = std.StringHashMap([]const u8).init(alloc);
     var i: usize = 4;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--set") and i + 1 < args.len) {
@@ -97,32 +88,24 @@ fn cmdNew(
                 std.debug.print("bad --set (want KEY=VALUE): {s}\n", .{pair});
                 std.process.exit(1);
             };
-            try kv.put(pair[0..eq], pair[eq + 1 ..]);
+            try user_vars.put(pair[0..eq], pair[eq + 1 ..]);
             i += 1;
         }
     }
 
-    const tname = if (std.mem.endsWith(u8, args[2], ".html")) args[2] else try std.fmt.allocPrint(alloc, "{s}.html", .{args[2]});
-    const tpath = try std.fs.path.join(alloc, &.{ lib.root, "templates", tname });
-    const src = std.Io.Dir.cwd().readFileAlloc(io, tpath, alloc, .limited(4 * 1024 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => {
-            std.debug.print("no template at {s}\n", .{tpath});
+    var diag: template.ScaffoldDiag = .{};
+    const r = template.scaffold(alloc, io, lib, args[2], args[3], &user_vars, &diag) catch |e| switch (e) {
+        error.TemplateNotFound => {
+            std.debug.print("no template at {s}\n", .{diag.template_abs});
+            std.process.exit(1);
+        },
+        error.DestinationExists => {
+            std.debug.print("refusing to overwrite {s}\n", .{diag.dest_abs});
             std.process.exit(1);
         },
         else => return e,
     };
-
-    const dname = if (std.mem.endsWith(u8, args[3], ".html")) args[3] else try std.fmt.allocPrint(alloc, "{s}.html", .{args[3]});
-    const dpath = try std.fs.path.join(alloc, &.{ lib.root, dname });
-    if (std.Io.Dir.cwd().access(io, dpath, .{})) |_| {
-        std.debug.print("refusing to overwrite {s}\n", .{dpath});
-        std.process.exit(1);
-    } else |_| {} // any access failure means no existing file to protect; the write below surfaces real errors
-
-    const r = try template.fill(alloc, src, &kv);
-    if (std.fs.path.dirname(dpath)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dpath, .data = r.out });
-    std.debug.print("wrote {s}\n", .{dpath});
+    std.debug.print("wrote {s}\n", .{r.dest_abs});
     if (r.unfilled.len > 0) {
         std.debug.print("unfilled:", .{});
         for (r.unfilled) |u| std.debug.print(" {s}", .{u});
