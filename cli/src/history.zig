@@ -147,6 +147,147 @@ pub fn showFile(
     return run.stdout;
 }
 
+/// Upper bound on stdout/stderr captured from the git write plumbing.
+/// Commit output is a handful of lines; a limit this generous only exists
+/// because every external read must have one.
+const commit_output_bytes_max = 64 * 1024;
+
+/// Outcome of `commitPaths`: whether a commit was created, its short sha,
+/// and, when nothing was committed or the sha lookup failed, one lowercase
+/// actionable line for the caller to surface. Deliberately not an error
+/// union: the server treats git as optional the same way `pageLog` does,
+/// so a missing repository degrades the report, never the write that
+/// preceded it.
+pub const CommitOutcome = struct {
+    committed: bool,
+    sha: []const u8 = "-",
+    note: []const u8 = "",
+};
+
+/// Argv staging exactly `rel_paths` and nothing else: the `--` pathspec
+/// separator keeps anything the owner staged by hand out of the server's
+/// commit. Pure so tests pin the exact shape without spawning git; the
+/// caller owns the returned slice (callers run on an arena).
+pub fn addArgv(
+    alloc: std.mem.Allocator,
+    root: []const u8,
+    rel_paths: []const []const u8,
+) ![]const []const u8 {
+    std.debug.assert(rel_paths.len > 0);
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ "git", "-C", root, "add", "--" });
+    try argv.appendSlice(alloc, rel_paths);
+    return try argv.toOwnedSlice(alloc);
+}
+
+/// Argv for the commit itself, pathspec-limited like `addArgv`. `author`
+/// carries remote attribution ("user via machine <email>"); null commits
+/// as the repository's own configured identity, which stays the committer
+/// either way. Pure for the same testability reason as `addArgv`.
+pub fn commitArgv(
+    alloc: std.mem.Allocator,
+    root: []const u8,
+    message: []const u8,
+    author: ?[]const u8,
+    rel_paths: []const []const u8,
+) ![]const []const u8 {
+    std.debug.assert(message.len > 0);
+    std.debug.assert(rel_paths.len > 0);
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(alloc);
+    try argv.appendSlice(alloc, &.{ "git", "-C", root, "commit" });
+    if (author) |a| try argv.appendSlice(alloc, &.{ "--author", a });
+    try argv.appendSlice(alloc, &.{ "-m", message, "--" });
+    try argv.appendSlice(alloc, rel_paths);
+    return try argv.toOwnedSlice(alloc);
+}
+
+/// The first non-blank line of subprocess output, trimmed; empty when the
+/// output is all whitespace. Git failure messages are one useful line
+/// followed by hints, and only the useful line belongs in a tool result.
+fn firstNonEmptyLine(output: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len > 0) return line;
+    }
+    return "";
+}
+
+/// Runs one git plumbing step; returns null on success, or the one-line
+/// reason on any failure (spawn failure, nonzero exit). Helpers compute,
+/// `commitPaths` decides.
+fn runGitStep(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    spawn_failure_note: []const u8,
+) ?[]const u8 {
+    const run = std.process.run(alloc, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(commit_output_bytes_max),
+        .stderr_limit = .limited(commit_output_bytes_max),
+    }) catch return spawn_failure_note;
+    switch (run.term) {
+        .exited => |code| if (code == 0) return null,
+        else => {},
+    }
+    // Git writes errors to stderr, but some refusals ("nothing to
+    // commit") land on stdout; report whichever spoke.
+    const stderr_line = firstNonEmptyLine(run.stderr);
+    if (stderr_line.len > 0) return stderr_line;
+    const stdout_line = firstNonEmptyLine(run.stdout);
+    if (stdout_line.len > 0) return stdout_line;
+    return "git exited nonzero with no output";
+}
+
+/// Stages exactly `rel_paths` and commits them with `message`, optionally
+/// attributed to `author` (see `commitArgv`). Never returns an error: a
+/// missing git binary, a root outside any repository, or a failing commit
+/// all come back as `committed = false` with an actionable note, because
+/// the file writes that preceded this call stand regardless and the
+/// caller must be able to say so. Allocations live on `alloc` (callers
+/// run on an arena).
+pub fn commitPaths(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    rel_paths: []const []const u8,
+    message: []const u8,
+    author: ?[]const u8,
+) CommitOutcome {
+    std.debug.assert(rel_paths.len > 0);
+    std.debug.assert(message.len > 0);
+    for (rel_paths) |rel| {
+        std.debug.assert(rel.len > 0);
+        std.debug.assert(!std.fs.path.isAbsolute(rel));
+    }
+
+    const add_argv = addArgv(alloc, root, rel_paths) catch
+        return .{ .committed = false, .note = "out of memory staging the commit" };
+    if (runGitStep(alloc, io, add_argv, "git is not available, commit skipped")) |note| {
+        return .{ .committed = false, .note = note };
+    }
+
+    const commit_argv = commitArgv(alloc, root, message, author, rel_paths) catch
+        return .{ .committed = false, .note = "out of memory staging the commit" };
+    if (runGitStep(alloc, io, commit_argv, "git is not available, commit skipped")) |note| {
+        return .{ .committed = false, .note = note };
+    }
+
+    const rev_run = std.process.run(alloc, io, .{
+        .argv = &.{ "git", "-C", root, "rev-parse", "--short", "HEAD" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return .{ .committed = true, .note = "committed, but the sha lookup failed" };
+    const sha = firstNonEmptyLine(rev_run.stdout);
+    if (!isCommitSha(sha)) {
+        return .{ .committed = true, .note = "committed, but the sha lookup failed" };
+    }
+    return .{ .committed = true, .sha = sha };
+}
+
 const t = std.testing;
 
 test "parseLog splits tab-separated commits, newest first" {
@@ -212,6 +353,121 @@ test "renderJson of no commits is an empty array" {
     const rendered = try renderJson(t.allocator, &.{});
     defer t.allocator.free(rendered);
     try t.expectEqualStrings("[]", rendered);
+}
+
+test "addArgv stages exactly the given paths behind a pathspec separator" {
+    const argv = try addArgv(t.allocator, "/lib", &.{ "advisory/one.html", "shares.log" });
+    defer t.allocator.free(argv);
+    const want = [_][]const u8{
+        "git", "-C", "/lib", "add", "--", "advisory/one.html", "shares.log",
+    };
+    try t.expectEqual(want.len, argv.len);
+    for (want, argv) |w, got| try t.expectEqualStrings(w, got);
+}
+
+test "commitArgv carries the author override when attribution is known" {
+    const argv = try commitArgv(
+        t.allocator,
+        "/lib",
+        "add the advisory",
+        "alice via laptop <alice@example.com>",
+        &.{"advisory/one.html"},
+    );
+    defer t.allocator.free(argv);
+    const want = [_][]const u8{
+        "git",      "-C",                                   "/lib", "commit",
+        "--author", "alice via laptop <alice@example.com>", "-m",   "add the advisory",
+        "--",       "advisory/one.html",
+    };
+    try t.expectEqual(want.len, argv.len);
+    for (want, argv) |w, got| try t.expectEqualStrings(w, got);
+}
+
+test "commitArgv without an author commits as the repository identity" {
+    const argv = try commitArgv(t.allocator, "/lib", "why", null, &.{"a.html"});
+    defer t.allocator.free(argv);
+    const want = [_][]const u8{ "git", "-C", "/lib", "commit", "-m", "why", "--", "a.html" };
+    try t.expectEqual(want.len, argv.len);
+    for (want, argv) |w, got| try t.expectEqualStrings(w, got);
+}
+
+test "firstNonEmptyLine finds the message in noisy subprocess output" {
+    try t.expectEqualStrings("fatal: not a git repository", firstNonEmptyLine("\n\nfatal: not a git repository\nhint: more\n"));
+    try t.expectEqualStrings("", firstNonEmptyLine("\n \r\n"));
+    try t.expectEqualStrings("one line", firstNonEmptyLine("one line"));
+}
+
+test "commitPaths in a real repository commits with the author override" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(root);
+
+    // Skip on machines without git; the degrade-gracefully contract is
+    // exercised by the not-a-repository test below either way.
+    const init_run = std.process.run(t.allocator, t.io, .{
+        .argv = &.{ "git", "-C", root, "init", "-q" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return error.SkipZigTest;
+    defer t.allocator.free(init_run.stdout);
+    defer t.allocator.free(init_run.stderr);
+    switch (init_run.term) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+    inline for (.{ .{ "user.name", "Library Owner" }, .{ "user.email", "owner@example.com" } }) |kv| {
+        const config_run = try std.process.run(t.allocator, t.io, .{
+            .argv = &.{ "git", "-C", root, "config", kv[0], kv[1] },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        t.allocator.free(config_run.stdout);
+        t.allocator.free(config_run.stderr);
+    }
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "one.html", .data = "<html></html>" });
+
+    // commitPaths allocates with the arena contract of its real callers
+    // (per-connection or per-command arenas); a bare t.allocator would
+    // report its unfreed argv and subprocess buffers as leaks.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const outcome = commitPaths(
+        arena_state.allocator(),
+        t.io,
+        root,
+        &.{"one.html"},
+        "add the page",
+        "alice via laptop <alice@example.com>",
+    );
+    try t.expect(outcome.committed);
+    try t.expect(isCommitSha(outcome.sha));
+    try t.expectEqualStrings("", outcome.note);
+
+    const log_run = try std.process.run(t.allocator, t.io, .{
+        .argv = &.{ "git", "-C", root, "log", "-1", "--format=%an|%ae|%cn" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer t.allocator.free(log_run.stdout);
+    defer t.allocator.free(log_run.stderr);
+    try t.expectEqualStrings(
+        "alice via laptop|alice@example.com|Library Owner",
+        std.mem.trimEnd(u8, log_run.stdout, "\n"),
+    );
+}
+
+test "commitPaths outside a repository reports and does not error" {
+    // NOTE: not a tmpDir on purpose. `t.tmpDir` lives under `.zig-cache`,
+    // which sits inside this project's own git repository, so `git -C`
+    // there would happily stage into the wrong repo. The filesystem root
+    // is the one directory guaranteed to be outside any repository.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const outcome = commitPaths(arena_state.allocator(), t.io, "/", &.{"one.html"}, "why", null);
+    try t.expect(!outcome.committed);
+    try t.expectEqualStrings("-", outcome.sha);
+    try t.expect(outcome.note.len > 0);
 }
 
 test "isCommitSha accepts 7 to 40 hex digits and nothing else" {
