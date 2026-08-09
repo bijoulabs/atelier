@@ -5,14 +5,18 @@ time-travels, and exports branded HTML pages.
 
 ![Halcyon, Works: a placeholder studio wearing the porcelain preset](docs/ledger.png)
 
-Your agents deliver here. The bundled Claude Code skill routes their
-plans, specs, proposals, and mockups into the library as branded pages:
-indexed and searchable the moment they exist, versioned by git, served
-on your own network, themed like they came from your studio. Because
-they did. `./install.sh` links the skill; that is the whole setup.
+Your agents deliver here, and not only yours. The served library
+speaks MCP, so every teammate points whatever agent they use at it and
+authors into the same shelves: indexed and searchable the moment a page
+exists, versioned by git, themed like it came from your studio. Because
+it did. Every remote change is attributed to who sent it, from which
+machine, without anyone registering anything. `./install.sh` on the
+machine that hosts the library; `atelier connect` prints the one line
+that joins everybody else.
 
     scaffold      new pages from your own masters, born on-brand
     serve         hot reload, search, clean URLs, chips
+    connect       remote authoring for every agent on your network
     time travel   any page, at any commit, straight out of git
     diff          any two versions, side by side, highlighted
     theme         live editor, five presets, themes as portable files
@@ -39,7 +43,8 @@ the tools and stays plain.
 That is a working library. The index builds itself, pages hot-reload,
 and the Theme chip in the corner opens a live editor. Everything above
 in the screenshot, including the accent on the wordmark's comma, came
-from that one line of manifest.
+from that one line of manifest. Teammates join with the line
+`atelier connect` prints; their agents arrive already briefed.
 
 ## Time travel and diffs
 
@@ -129,6 +134,12 @@ every mutation is path-fenced, size-capped, serialized, and attributed:
 - Exports land in `<library>/shares/`: served over HTTP, listed in
   `shares.log` (with a column naming the submitter), kept off the
   ledger. Rendering needs Chromium on the serve machine.
+
+The history reads like a guest book:
+
+    $ git log --format='%an | %s'
+    alice@example.com via laptop | send the q3 brief to Globex
+    bob@example.com via studio-air | draft the q3 brief
 
 One small shadow: the `/mcp` path wins over a root-level file that
 would serve there, the same shadowing as `/__theme`. Requests need a
