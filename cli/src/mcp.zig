@@ -15,6 +15,8 @@ const index = @import("index.zig");
 const check = @import("check.zig");
 const template = @import("template.zig");
 const history = @import("history.zig");
+const share = @import("share.zig");
+const pdf = @import("pdf.zig");
 
 /// Protocol revisions this endpoint knows how to speak. `initialize`
 /// echoes a requested version from this set and otherwise answers with
@@ -142,6 +144,25 @@ const tool_defs = [_]ToolDef{
         .description = "Rebuild the library's index.html now. Normally unnecessary: the server reindexes within about a second of any write when live reload is on; this exists for servers running with reload off.",
         .input_schema = "{\"type\":\"object\",\"properties\":{}}",
         .handler = toolReindex,
+    },
+    .{
+        .name = "share_document",
+        .description = "Export a page as a provenance-stamped PDF for someone outside the team, and record the send in the share ledger. Prefer this over render_pdf for anything leaving the building.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"the page to share\"}," ++
+            "\"recipient\":{\"type\":\"string\",\"description\":\"who it is prepared for; letters, digits, spaces, dots, dashes\"}," ++
+            "\"commit_message\":{\"type\":\"string\",\"description\":\"why; commits the PDF and the ledger entry\"}}," ++
+            "\"required\":[\"path\"]}",
+        .handler = toolShareDocument,
+    },
+    .{
+        .name = "render_pdf",
+        .description = "Render a page (optionally at a past commit sha) to an unstamped PDF under /shares/ on this server.",
+        .input_schema = "{\"type\":\"object\",\"properties\":{" ++
+            "\"path\":{\"type\":\"string\",\"description\":\"the page to render\"}," ++
+            "\"rev\":{\"type\":\"string\",\"description\":\"a commit sha (7 to 40 hex digits) to render the page as it was then\"}}," ++
+            "\"required\":[\"path\"]}",
+        .handler = toolRenderPdf,
     },
 };
 
@@ -478,6 +499,147 @@ fn toolReindex(ctx: *const ToolContext) anyerror!ToolResult {
     const dest = try std.fs.path.join(ctx.alloc, &.{ lib.root, "index.html" });
     try library.writeFileAtomic(ctx.io, ctx.alloc, dest, page);
     return .{ .text = "index.html rebuilt" };
+}
+
+/// What may name a share recipient: it lands in a filename and in the
+/// stamped page, so the shape is fenced like paths are. Letters, digits,
+/// spaces, dots, dashes, underscores; no leading dot; at most 64 bytes.
+pub fn isSafeRecipient(recipient: []const u8) bool {
+    if (recipient.len == 0 or recipient.len > 64) return false;
+    if (recipient[0] == '.') return false;
+    for (recipient) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', ' ', '.', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// Resolves a page argument shared by the export tools: clean-URL rule,
+/// shape fence, must name an .html page.
+fn pageRelArg(ctx: *const ToolContext) anyerror!union(enum) { rel: []u8, failed: ToolResult } {
+    const raw = argString(ctx.arguments, "path") orelse {
+        return .{ .failed = try toolError(ctx.alloc, "path is required", .{}) };
+    };
+    const rel = try cleanRel(ctx.alloc, raw);
+    if (!isSafeRelPath(rel) or !std.mem.endsWith(u8, rel, ".html")) {
+        return .{ .failed = try toolError(ctx.alloc, "bad page path: {s}", .{raw}) };
+    }
+    return .{ .rel = rel };
+}
+
+/// Maps a pdf.render failure to the tool-result voice the CLI uses.
+fn renderFailure(ctx: *const ToolContext, e: anyerror, failure: ?pdf.Failure) anyerror!ToolResult {
+    switch (e) {
+        error.NoChromium => {
+            return toolError(ctx.alloc, "install chromium (or google-chrome-stable) on the serve machine for pdf rendering", .{});
+        },
+        error.ChromiumFailed => {
+            const f = failure.?;
+            return toolError(ctx.alloc, "{s} failed with exit code {d}", .{ f.bin, f.code });
+        },
+        else => return e,
+    }
+}
+
+fn toolShareDocument(ctx: *const ToolContext) anyerror!ToolResult {
+    const rel = switch (try pageRelArg(ctx)) {
+        .failed => |failed| return failed,
+        .rel => |rel| rel,
+    };
+    const recipient = argString(ctx.arguments, "recipient");
+    if (recipient) |who_for| {
+        if (!isSafeRecipient(who_for)) {
+            return toolError(ctx.alloc, "bad recipient: letters, digits, spaces, dots, dashes, underscores only", .{});
+        }
+    }
+
+    const lib = try resolveLib(ctx);
+    const stem = blk: {
+        const base = std.fs.path.basename(rel);
+        break :blk base[0 .. base.len - ".html".len];
+    };
+    const date = try share.isoDate(ctx.alloc, std.Io.Clock.now(.real, ctx.io).toSeconds());
+    const out_name = if (recipient) |who_for|
+        try std.fmt.allocPrint(ctx.alloc, "{s}-{s}-{s}.pdf", .{ stem, who_for, date })
+    else
+        try std.fmt.allocPrint(ctx.alloc, "{s}-{s}.pdf", .{ stem, date });
+    const shares_abs = try std.fs.path.join(ctx.alloc, &.{ lib.root, "shares" });
+    const out_abs = try std.fs.path.join(ctx.alloc, &.{ shares_abs, out_name });
+    const out_rel = try std.fmt.allocPrint(ctx.alloc, "shares/{s}", .{out_name});
+
+    library.write_mu.lock(ctx.io) catch return toolError(ctx.alloc, "server shutting down", .{});
+    defer library.write_mu.unlock(ctx.io);
+    try std.Io.Dir.cwd().createDirPath(ctx.io, shares_abs);
+
+    const who = identity.resolve(ctx.alloc, ctx.io, ctx.peer);
+    const who_label = identity.label(ctx.alloc, who) catch "unknown";
+    var failure: ?pdf.Failure = null;
+    const shared = share.sharePage(ctx.alloc, ctx.io, lib, rel, recipient, out_abs, who_label, &failure) catch |e| switch (e) {
+        error.PageNotFound => return toolError(ctx.alloc, "no page at {s}", .{rel}),
+        else => return renderFailure(ctx, e, failure),
+    };
+
+    const tail = try attributeAndCommit(ctx, &.{ out_rel, "shares.log" }, argString(ctx.arguments, "commit_message"));
+    return .{ .text = try std.fmt.allocPrint(ctx.alloc, "shared {s}: pdf at /{s} {s}; logged: {s}", .{
+        rel,
+        out_rel,
+        tail,
+        std.mem.trimEnd(u8, shared.log_line, "\n"),
+    }) };
+}
+
+fn toolRenderPdf(ctx: *const ToolContext) anyerror!ToolResult {
+    const rel = switch (try pageRelArg(ctx)) {
+        .failed => |failed| return failed,
+        .rel => |rel| rel,
+    };
+    const rev = argString(ctx.arguments, "rev");
+    if (rev) |sha| {
+        // The CLI takes any revspec because argv is the operator's own;
+        // network input is gated to bare shas before it can reach git.
+        if (!history.isCommitSha(sha)) {
+            return toolError(ctx.alloc, "rev must be a commit sha of 7 to 40 hex digits; the page's history widget lists them", .{});
+        }
+    }
+
+    const lib = try resolveLib(ctx);
+    const stem = blk: {
+        const base = std.fs.path.basename(rel);
+        break :blk base[0 .. base.len - ".html".len];
+    };
+    const out_name = if (rev) |sha|
+        try std.fmt.allocPrint(ctx.alloc, "{s}-{s}.pdf", .{ stem, sha })
+    else
+        try std.fmt.allocPrint(ctx.alloc, "{s}.pdf", .{stem});
+    const shares_abs = try std.fs.path.join(ctx.alloc, &.{ lib.root, "shares" });
+    const out_abs = try std.fs.path.join(ctx.alloc, &.{ shares_abs, out_name });
+
+    library.write_mu.lock(ctx.io) catch return toolError(ctx.alloc, "server shutting down", .{});
+    defer library.write_mu.unlock(ctx.io);
+    try std.Io.Dir.cwd().createDirPath(ctx.io, shares_abs);
+
+    var rev_temp: ?[]const u8 = null;
+    defer if (rev_temp) |temp| std.Io.Dir.cwd().deleteFile(ctx.io, temp) catch {}; // best effort; dot-files never index
+    const page_abs = blk: {
+        if (rev) |sha| {
+            const temp = pdf.materializeRev(ctx.alloc, ctx.io, lib.root, rel, sha) catch |e| switch (e) {
+                error.GitUnavailable => return toolError(ctx.alloc, "git is unavailable on the serve machine; rev needs it", .{}),
+                error.GitShowFailed => return toolError(ctx.alloc, "git show {s}:{s} failed; check the revision and page", .{ sha, rel }),
+                else => return e,
+            };
+            rev_temp = temp;
+            break :blk temp;
+        }
+        const abs = try std.fs.path.join(ctx.alloc, &.{ lib.root, rel });
+        if (std.Io.Dir.cwd().access(ctx.io, abs, .{})) |_| {} else |_| {
+            return toolError(ctx.alloc, "no page at {s}", .{rel});
+        }
+        break :blk abs;
+    };
+
+    var failure: ?pdf.Failure = null;
+    pdf.render(ctx.alloc, ctx.io, page_abs, out_abs, &failure) catch |e| return renderFailure(ctx, e, failure);
+    return .{ .text = try std.fmt.allocPrint(ctx.alloc, "wrote /shares/{s}", .{out_name}) };
 }
 
 fn toolGetBrandGuidelines(ctx: *const ToolContext) anyerror!ToolResult {
@@ -1110,6 +1272,82 @@ test "reindex rebuilds the ledger on demand" {
     try t.expect(!outcome.is_error);
     const ledger = try tmp.dir.readFileAlloc(t.io, "index.html", a, .limited(1024 * 1024));
     try t.expect(std.mem.indexOf(u8, ledger, "P") != null);
+}
+
+test "isSafeRecipient rejects path and control characters" {
+    try t.expect(isSafeRecipient("Globex"));
+    try t.expect(isSafeRecipient("Globex Corp"));
+    try t.expect(isSafeRecipient("om-vc_2.0"));
+    try t.expect(!isSafeRecipient(""));
+    try t.expect(!isSafeRecipient(".hidden"));
+    try t.expect(!isSafeRecipient("a/b"));
+    try t.expect(!isSafeRecipient("a\\b"));
+    try t.expect(!isSafeRecipient("a\tb"));
+    const long: [65]u8 = @splat('a');
+    try t.expect(!isSafeRecipient(&long));
+}
+
+test "share_document renders into shares/ and records the six-column ledger" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{\"name\":\"Test Firm\"}" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "memo.html", .data = "<html><body><h1>Memo</h1></body></html>" });
+
+    const outcome = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"share_document\",\"arguments\":{\"path\":\"memo\",\"recipient\":\"Globex\"}}}"));
+    if (outcome.is_error and std.mem.indexOf(u8, outcome.text, "chromium") != null) return error.SkipZigTest;
+    try t.expect(!outcome.is_error);
+    try t.expect(std.mem.indexOf(u8, outcome.text, "/shares/memo-Globex-") != null);
+    try t.expect(std.mem.indexOf(u8, outcome.text, "as local") != null);
+
+    const log = try tmp.dir.readFileAlloc(t.io, "shares.log", a, .limited(4096));
+    var columns = std.mem.splitScalar(u8, std.mem.trimEnd(u8, log, "\n"), '\t');
+    var column_count: usize = 0;
+    var last: []const u8 = "";
+    while (columns.next()) |column| {
+        column_count += 1;
+        last = column;
+    }
+    try t.expectEqual(@as(usize, 6), column_count);
+    try t.expectEqualStrings("local", last);
+
+    const bad_recipient = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"share_document\",\"arguments\":{\"path\":\"memo\",\"recipient\":\"../evil\"}}}"));
+    try t.expect(bad_recipient.is_error);
+}
+
+test "render_pdf gates network revs on sha shape" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "atelier.json", .data = "{}" });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "memo.html", .data = "<html><body>hi</body></html>" });
+
+    // Revspecs that are not bare shas never reach a git argv from the
+    // network, unlike the CLI where argv is the operator's own.
+    const gated = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"render_pdf\",\"arguments\":{\"path\":\"memo\",\"rev\":\"HEAD\"}}}"));
+    try t.expect(gated.is_error);
+    try t.expect(std.mem.indexOf(u8, gated.text, "sha") != null);
+
+    const missing = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"render_pdf\",\"arguments\":{\"path\":\"ghost\"}}}"));
+    try t.expect(missing.is_error);
+
+    const rendered = try toolOutcome(a, callAt(a, root, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"render_pdf\",\"arguments\":{\"path\":\"memo\"}}}"));
+    if (rendered.is_error and std.mem.indexOf(u8, rendered.text, "chromium") != null) return error.SkipZigTest;
+    try t.expect(!rendered.is_error);
+    try t.expect(std.mem.indexOf(u8, rendered.text, "/shares/memo.pdf") != null);
+    const pdf_bytes = try tmp.dir.readFileAlloc(t.io, "shares/memo.pdf", a, .limited(16 * 1024 * 1024));
+    try t.expect(std.mem.startsWith(u8, pdf_bytes, "%PDF"));
 }
 
 test "list_templates names each master and its placeholders" {
