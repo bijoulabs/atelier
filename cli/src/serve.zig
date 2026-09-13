@@ -672,7 +672,11 @@ pub const theme_chip_snippet = "<style>@media print{#atelier-theme{display:none}
 /// other side by convention: a lone `from` diffs against `current`, a
 /// lone `to` diffs against its parent (the next row down). On a snapshot
 /// view the pinned sha and `current` come pre-selected.
-pub const history_snippet = "<style>@media print{#atelier-history,#atelier-history-panel{display:none}}" ++
+///
+/// The print rule is `!important` because the script reveals the chip
+/// and panel through inline `style.display`, which outranks any plain
+/// stylesheet rule; without it the chip prints.
+pub const history_snippet = "<style>@media print{#atelier-history,#atelier-history-panel{display:none!important}}" ++
     "#atelier-history{position:fixed;top:14px;right:14px;z-index:9999;display:none;" ++
     "font:600 10px/1 ui-monospace,monospace;letter-spacing:.14em;text-transform:uppercase;" ++
     "color:#fff;background:rgba(20,18,15,.78);padding:7px 11px;border-radius:2px;cursor:pointer}" ++
@@ -1195,7 +1199,9 @@ test "history snippet wires the fetch, snapshot links, and print hiding" {
     try t.expect(std.mem.indexOf(u8, history_snippet, "id=\"atelier-history-panel\"") != null);
     try t.expect(std.mem.indexOf(u8, history_snippet, "'/__history'") != null);
     try t.expect(std.mem.indexOf(u8, history_snippet, "'/@'+") != null);
-    try t.expect(std.mem.indexOf(u8, history_snippet, "@media print") != null);
+    // The script reveals the chip and panel with inline display, which
+    // outranks any stylesheet rule that is not !important.
+    try t.expect(std.mem.indexOf(u8, history_snippet, "@media print{#atelier-history,#atelier-history-panel{display:none!important}}") != null);
     try t.expect(std.mem.indexOf(u8, history_snippet, "location.pathname") != null);
 }
 
